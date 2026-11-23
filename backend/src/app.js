@@ -54,7 +54,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // Tangani preflight request secara eksplisit
-app.options('*', cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 
 // =====================================================
 // SECURITY MIDDLEWARE
