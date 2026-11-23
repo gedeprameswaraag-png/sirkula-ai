@@ -409,30 +409,20 @@ async function analyzeWasteImage(
   filename = 'waste.jpg'
 ) {
   try {
-    return await analyzeWithGemini(
-      fileBuffer,
-      mimeType
-    );
+    return await analyzeWithGemini(fileBuffer, mimeType);
   } catch (geminiError) {
-    console.warn(
-      '[AI Fallback] Gemini gagal. Beralih ke ONNX:',
-      geminiError.message
-    );
+    console.error('[Gemini ERROR]', {
+      status: geminiError.status,
+      message: geminiError.message
+    });
 
     try {
-      return await analyzeWithLocalModel(
-        fileBuffer,
-        mimeType,
-        filename
-      );
+      return await analyzeWithLocalModel(fileBuffer, mimeType, filename);
     } catch (localError) {
-      console.error(
-        '[AI Fallback Error] Gemini dan ONNX gagal:',
-        localError.message
-      );
+      console.error('[ONNX ERROR]', localError.message);
 
       throw new Error(
-        'Layanan AI sedang tidak tersedia.'
+        `Layanan AI tidak tersedia. Gemini: ${geminiError.message}`
       );
     }
   }
