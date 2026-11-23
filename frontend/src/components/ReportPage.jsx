@@ -3,7 +3,7 @@ import CameraCapture from './CameraCapture.jsx';
 import { makeThumb } from '../utils/image.js';
 
 export default function ReportPage({ pos, geoError, onSendToBackend, goMap }) {
-  const [step, setStep] = useState('camera'); // camera | review | sending | outcome
+  const [step, setStep] = useState('camera');
   const [shot, setShot] = useState(null);
   const [description, setDescription] = useState('');
   const [outcome, setOutcome] = useState(null);
@@ -28,111 +28,104 @@ export default function ReportPage({ pos, geoError, onSendToBackend, goMap }) {
       });
 
       if (res.rejected_by_ai) {
-        setOutcome({
-          tone: 'bad',
-          title: 'Foto Tidak Dapat Diterima',
-          body: res.reason || 'Foto tidak valid atau tidak ditemukan tumpukan sampah.',
-          done: false
-        });
+        setOutcome({ tone: 'bad', title: 'Foto Tidak Dapat Diterima', body: res.reason || 'Foto tidak valid atau tidak ditemukan tumpukan sampah.', done: false });
       } else if (res.merged_location) {
         setOutcome({
           tone: 'ok',
           title: 'Laporan Digabungkan ke Titik yang Sama',
           body: `Lokasi berjarak ${res.distance_m} m dari "${res.matched_hotspot?.title}". Foto Anda otomatis digabungkan ke titik tersebut tanpa perlu konfirmasi ulang Admin.`,
-          thumb,
-          done: true
+          thumb, done: true
         });
       } else {
         setOutcome({
           tone: 'ok',
           title: 'Laporan Berhasil Terkirim',
           body: 'Laporan lokasi baru Anda telah dikirim dan menunggu verifikasi Admin sebelum diterbitkan di peta.',
-          thumb,
-          done: true
+          thumb, done: true
         });
       }
     } catch (err) {
-      setOutcome({
-        tone: 'bad',
-        title: 'Gagal Mengirim Laporan',
-        body: err.message || 'Pastikan server backend sedang menyala.',
-        done: false
-      });
+      setOutcome({ tone: 'bad', title: 'Gagal Mengirim Laporan', body: err.message || 'Pastikan server backend sedang menyala.', done: false });
     }
     setStep('outcome');
   };
 
   const weak = pos && pos.accuracy > 100;
   const gpsText = pos
-    ? weak
-      ? `Sinyal GPS lemah (±${Math.round(pos.accuracy)} m)`
-      : `GPS Siap (±${Math.round(pos.accuracy)} m)`
+    ? weak ? `Sinyal GPS lemah (±${Math.round(pos.accuracy)} m)` : `GPS Siap (±${Math.round(pos.accuracy)} m)`
     : geoError || 'Mencari titik koordinat GPS…';
 
   return (
-    <section className="page report" style={{ maxWidth: '580px', margin: '0 auto', padding: '20px 16px' }}>
-      <h2 style={{ margin: '0 0 4px 0', fontSize: '1.25rem' }}>Laporkan Titik Sampah</h2>
-      <p style={{ margin: '0 0 14px 0', fontSize: '0.88rem', color: '#64748b' }}>
-        Pengunjung dapat langsung mengambil foto kamera dan mengirim laporan tanpa login.
-      </p>
+    <section className="report-page">
+      <div className="report-intro">
+        <span className="eyebrow">AKSI LINGKUNGAN</span>
+        <h1>Laporkan Titik Sampah</h1>
+        <p>Ambil foto, biarkan AI membantu memvalidasi, lalu bantu tim menemukan lokasi yang perlu ditangani.</p>
+      </div>
 
-      <div className={`gps ${pos && !weak ? 'ok' : pos ? 'warn' : geoError ? 'bad' : ''}`} style={{ marginBottom: '14px' }}>
-        {gpsText}
+      <div className={`gps ${pos && !weak ? 'ok' : pos ? 'warn' : geoError ? 'bad' : ''}`}>
+        <span className="gps-dot" />
+        <span>{gpsText}</span>
       </div>
 
       {step === 'camera' && (
-        <CameraCapture
-          disabled={!pos}
-          hint="Kamera aktif otomatis setelah titik koordinat GPS ditemukan."
-          onCapture={(blob) => {
-            setShot({ blob, url: URL.createObjectURL(blob), pos });
-            setStep('review');
-          }}
-        />
+        <div className="report-card camera-card">
+          <div className="card-kicker">01 · BUKTI FOTO</div>
+          <h2>Ambil foto kondisi sampah</h2>
+          <p>Pastikan objek terlihat jelas dan lokasi GPS sudah aktif sebelum mengambil foto.</p>
+          <CameraCapture
+            disabled={!pos}
+            hint="Kamera aktif otomatis setelah titik koordinat GPS ditemukan."
+            onCapture={(blob) => {
+              setShot({ blob, url: URL.createObjectURL(blob), pos });
+              setStep('review');
+            }}
+          />
+        </div>
       )}
 
       {step === 'review' && shot && (
-        <div className="review" style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-          <img src={shot.url} alt="Pratinjau foto" style={{ width: '100%', borderRadius: '8px', maxHeight: '320px', objectFit: 'cover' }} />
-          <p className="meta" style={{ margin: '8px 0', fontSize: '0.82rem', color: '#475569' }}>
-            {shot.pos.lat.toFixed(5)}, {shot.pos.lng.toFixed(5)} · ±{Math.round(shot.pos.accuracy)} m
-          </p>
+        <div className="report-card review-card">
+          <div className="card-kicker">02 · TINJAU</div>
+          <h2>Periksa laporan sebelum dikirim</h2>
+          <img src={shot.url} alt="Pratinjau foto" />
+          <p className="meta">{shot.pos.lat.toFixed(5)}, {shot.pos.lng.toFixed(5)} · ±{Math.round(shot.pos.accuracy)} m</p>
           <input
+            className="field"
             type="text"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="Catatan kondisi sampah (opsional)..."
-            style={{ width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #cbd5e1', marginBottom: '12px' }}
+            placeholder="Catatan kondisi sampah (opsional)…"
           />
-          <div className="row" style={{ display: 'flex', gap: '10px' }}>
-            <button className="btn" onClick={reset} style={{ flex: 1 }}>Ulangi Foto</button>
-            <button className="btn primary" onClick={submit} style={{ flex: 1, background: '#0f766e', color: '#fff' }}>Kirim Laporan</button>
+          <div className="action-row">
+            <button className="btn" onClick={reset}>Ulangi Foto</button>
+            <button className="btn primary" onClick={submit}>Kirim Laporan ↗</button>
           </div>
         </div>
       )}
 
       {step === 'sending' && (
-        <div className="sending" style={{ textAlign: 'center', padding: '40px 0' }}>
+        <div className="report-card sending">
           <div className="spinner" />
-          <p>Mengirim foto & koordinat lokasi…</p>
+          <h2>Memproses laporan…</h2>
+          <p>Mengirim foto & koordinat lokasi ke Sirkula AI.</p>
         </div>
       )}
 
       {step === 'outcome' && outcome && (
-        <div className={`outcome ${outcome.tone}`} style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #cbd5e1' }}>
-          <h2 style={{ marginTop: 0 }}>{outcome.title}</h2>
+        <div className={`report-card outcome ${outcome.tone}`}>
+          <div className="outcome-icon">{outcome.tone === 'ok' ? '✓' : '!'}</div>
+          <h2>{outcome.title}</h2>
           <p>{outcome.body}</p>
-          {outcome.thumb && (
-            <img src={outcome.thumb} alt="Bukti terkirim" style={{ width: '100%', maxHeight: '180px', objectFit: 'cover', borderRadius: '8px', margin: '10px 0' }} />
-          )}
-          <div className="row" style={{ display: 'flex', gap: '10px', marginTop: '12px' }}>
+          {outcome.thumb && <img src={outcome.thumb} alt="Bukti terkirim" />}
+          <div className="action-row">
             {outcome.done ? (
               <>
-                <button className="btn" onClick={reset} style={{ flex: 1 }}>Lapor Lagi</button>
-                <button className="btn primary" onClick={goMap} style={{ flex: 1, background: '#0f766e', color: '#fff' }}>Lihat di Peta</button>
+                <button className="btn" onClick={reset}>Lapor Lagi</button>
+                <button className="btn primary" onClick={goMap}>Lihat di Peta ↗</button>
               </>
             ) : (
-              <button className="btn primary" onClick={reset} style={{ width: '100%' }}>Ambil Foto Ulang</button>
+              <button className="btn primary block" onClick={reset}>Ambil Foto Ulang</button>
             )}
           </div>
         </div>

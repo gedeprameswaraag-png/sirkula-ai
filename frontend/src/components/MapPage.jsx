@@ -230,7 +230,7 @@ export default function MapPage({
   const isVerifiedVolunteer = currentUser?.volunteer_status === 'verified' || ['admin', 'super_admin'].includes(currentUser?.role);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 105px)', position: 'relative' }}>
+    <div className="map-page-shell" style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 105px)', position: 'relative' }}>
       {/* Bar Statistik & Filter */}
       <div
         style={{

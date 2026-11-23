@@ -30,6 +30,15 @@ export default function App() {
       setPage('volunteer');
       window.history.replaceState(null, '', window.location.pathname);
     } else if (hash.includes('access_token=') && hash.includes('type=signup')) {
+      if (!supabase) {
+        setAuthNotice({
+          type: 'error',
+          message: 'Supabase belum dikonfigurasi. Isi file .env terlebih dahulu.'
+        });
+        setPage('volunteer');
+        window.history.replaceState(null, '', window.location.pathname);
+        return;
+      }
       supabase.auth.signOut().finally(() => {
         setAuthNotice({
           type: 'success',

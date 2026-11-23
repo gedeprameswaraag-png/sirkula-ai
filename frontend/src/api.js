@@ -3,8 +3,8 @@ import { supabase } from './supabaseClient';
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 async function requestApi(endpoint, options = {}) {
-  const { data: { session } } = await supabase.auth.getSession();
-  const token = session?.access_token;
+  const sessionResult = supabase ? await supabase.auth.getSession() : { data: { session: null } };
+  const token = sessionResult.data.session?.access_token;
 
   const headers = {
     ...(options.headers || {}),
@@ -34,7 +34,9 @@ async function requestApi(endpoint, options = {}) {
 export const sessionApi = {
   async login(email, password) {
     // Bersihkan cache sesi lama agar status konfirmasi email terbaru langsung terbaca
-    await supabase.auth.signOut().catch(() => {});
+    if (supabase) await supabase.auth.signOut().catch(() => {});
+
+    if (!supabase) throw new Error('Supabase belum dikonfigurasi. Isi VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY pada file .env.');
 
     const { data, error } = await supabase.auth.signInWithPassword({
       email: email.trim().toLowerCase(),
@@ -55,6 +57,7 @@ export const sessionApi = {
     await supabase.auth.signOut();
   },
   async getSessionProfile() {
+    if (!supabase) return null;
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) return null;
     try {
@@ -102,6 +105,8 @@ export const publicApi = {
     };
   },
   async resendVerificationEmail(email) {
+    if (!supabase) throw new Error('Supabase belum dikonfigurasi. Isi VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY pada file .env.');
+
     const { error } = await supabase.auth.resend({
       type: 'signup',
       email: email.trim().toLowerCase(),
