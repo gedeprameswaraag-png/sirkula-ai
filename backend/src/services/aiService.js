@@ -1,13 +1,17 @@
-
 const { GoogleGenAI } = require('@google/genai');
 const env = require('../config/env');
 
-const LOCAL_AI_URL =
-  process.env.LOCAL_AI_URL || 'http://127.0.0.1:8000/analyze';
+// ONNX hanya aktif jika LOCAL_AI_URL diisi eksplisit (tidak untuk Vercel).
+const LOCAL_AI_URL = process.env.LOCAL_AI_URL || '';
 
 const LOCAL_AI_TIMEOUT_MS = Number(
   process.env.LOCAL_AI_TIMEOUT_MS || 30000
 );
+
+const GEMINI_MODEL =
+  env.GEMINI_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+const RETRYABLE_STATUS = [500, 502, 503, 504];
 
 const VALID_CATEGORIES = [
   'invalid_photo',
@@ -15,6 +19,26 @@ const VALID_CATEGORIES = [
   'waste_detected',
   'review_required'
 ];
+
+let geminiClient = null;
+
+function getGeminiClient() {
+  const apiKey = env.GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY tidak dikonfigurasi.');
+  }
+
+  if (!geminiClient) {
+    geminiClient = new GoogleGenAI({ apiKey });
+  }
+
+  return geminiClient;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function clampScore(value, min = 0, max = 100) {
   const number = Number(value);
@@ -110,6 +134,16 @@ function computeLocalImpactScore(data) {
   return clampScore(base + areaBonus + countBonus, 15, 100);
 }
 
+// Membersihkan pagar kode markdown jika model tetap menambahkannya.
+function parseJsonResponse(text) {
+  const cleaned = String(text || '')
+    .replace(/^\s*```(?:json)?/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
+
+  return JSON.parse(cleaned);
+}
+
 // =====================================================
 // 1. FALLBACK: MODEL LOKAL ONNX MELALUI PYTHON FASTAPI
 // =====================================================
@@ -119,6 +153,10 @@ async function analyzeWithLocalModel(
   mimeType,
   filename = 'waste.jpg'
 ) {
+  if (!LOCAL_AI_URL) {
+    throw new Error('LOCAL_AI_URL tidak diisi, fallback ONNX dinonaktifkan.');
+  }
+
   const formData = new FormData();
 
   const blob = new Blob([fileBuffer], { type: mimeType });
@@ -229,9 +267,8 @@ async function analyzeWithLocalModel(
     is_valid_capture: true,
     is_clean_location: false,
 
-    // ONNX saat ini belum memvalidasi foto layar, poster,
-    // ilustrasi, atau media cetak secara khusus.
-    // Karena itu, hasilnya tetap perlu pemeriksaan admin.
+    // ONNX belum memvalidasi foto layar, poster, ilustrasi,
+    // atau media cetak, sehingga tetap perlu pemeriksaan admin.
     needs_admin_review: true,
 
     severity_level: severityLevel,
@@ -247,18 +284,7 @@ async function analyzeWithLocalModel(
 // 2. AI UTAMA: GEMINI
 // =====================================================
 
-async function analyzeWithGemini(fileBuffer, mimeType) {
-  if (!env.GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY tidak dikonfigurasi.');
-  }
-
-  const ai = new GoogleGenAI({
-    apiKey: env.GEMINI_API_KEY
-  });
-
-  const base64Image = fileBuffer.toString('base64');
-
-  const prompt = `
+const GEMINI_PROMPT = `
 Kamu adalah sistem validasi foto untuk aplikasi pelaporan sampah lingkungan.
 
 Tujuan utama:
@@ -326,16 +352,40 @@ capture_category hanya boleh:
 invalid_photo, clean_location, waste_detected, review_required.
 `;
 
-  const response = await ai.models.generateContent({
-    model: env.GEMINI_MODEL || 'gemini-2.5-flash',
+async function generateWithRetry(request, maxRetries = 2) {
+  const ai = getGeminiClient();
+  let lastError;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await ai.models.generateContent(request);
+    } catch (error) {
+      lastError = error;
+
+      const status = Number(error.status || error.code);
+
+      if (!RETRYABLE_STATUS.includes(status) || attempt === maxRetries) {
+        throw error;
+      }
+
+      await sleep(1000 * 2 ** attempt);
+    }
+  }
+
+  throw lastError;
+}
+
+async function analyzeWithGemini(fileBuffer, mimeType) {
+  const response = await generateWithRetry({
+    model: GEMINI_MODEL,
     contents: [
-      prompt,
       {
         inlineData: {
-          data: base64Image,
+          data: fileBuffer.toString('base64'),
           mimeType
         }
-      }
+      },
+      GEMINI_PROMPT
     ],
     config: {
       responseMimeType: 'application/json'
@@ -349,14 +399,12 @@ invalid_photo, clean_location, waste_detected, review_required.
   let parsed;
 
   try {
-    parsed = JSON.parse(response.text);
+    parsed = parseJsonResponse(response.text);
   } catch {
     throw new Error('Respons Gemini bukan JSON yang valid.');
   }
 
-  const category = String(
-    parsed.capture_category || ''
-  ).toLowerCase();
+  const category = String(parsed.capture_category || '').toLowerCase();
 
   if (!VALID_CATEGORIES.includes(category)) {
     throw new Error('Kategori hasil Gemini tidak valid.');
@@ -366,11 +414,7 @@ invalid_photo, clean_location, waste_detected, review_required.
     parsed.description || 'Analisis foto selesai.'
   ).slice(0, 1000);
 
-  const impactScore = clampScore(
-    parsed.impact_score,
-    0,
-    100
-  );
+  const impactScore = clampScore(parsed.impact_score, 0, 100);
 
   if (category === 'invalid_photo') {
     return invalidPhotoResult(description, 'gemini');
@@ -390,17 +434,14 @@ invalid_photo, clean_location, waste_detected, review_required.
     is_valid_capture: true,
     is_clean_location: false,
     needs_admin_review: false,
-    severity_level: normalizeSeverity(
-      parsed.severity_level,
-      impactScore
-    ),
+    severity_level: normalizeSeverity(parsed.severity_level, impactScore),
     impact_score: Math.max(15, impactScore),
     description
   };
 }
 
 // =====================================================
-// 3. FUNGSI UTAMA: GEMINI -> ONNX FALLBACK
+// 3. FUNGSI UTAMA: GEMINI (ONNX hanya jika LOCAL_AI_URL diisi)
 // =====================================================
 
 async function analyzeWasteImage(
@@ -412,9 +453,14 @@ async function analyzeWasteImage(
     return await analyzeWithGemini(fileBuffer, mimeType);
   } catch (geminiError) {
     console.error('[Gemini ERROR]', {
+      model: GEMINI_MODEL,
       status: geminiError.status,
       message: geminiError.message
     });
+
+    if (!LOCAL_AI_URL) {
+      throw new Error(`Layanan AI tidak tersedia. ${geminiError.message}`);
+    }
 
     try {
       return await analyzeWithLocalModel(fileBuffer, mimeType, filename);
