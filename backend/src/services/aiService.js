@@ -1,143 +1,174 @@
-const ai = require('../config/gemini');
+const { GoogleGenAI } = require('@google/genai');
 const env = require('../config/env');
-const { validateAiAnalysis } = require('../utils/aiValidator');
-const ApiError = require('../utils/ApiError');
 
-const SEVERITY_MAP = {
-  low: { level: 'ringan', score: 30 },
-  medium: { level: 'sedang', score: 55 },
-  high: { level: 'parah', score: 85 },
-  unknown: { level: 'sedang', score: 50 }
-};
+const LOCAL_AI_URL = process.env.LOCAL_AI_URL || 'http://127.0.0.1:8000/analyze';
 
-const PROMPT = `Kamu adalah AI Computer Vision untuk SirkulaAI, sistem pelaporan dan pemetaan hotspot sampah di lingkungan nyata.
-Identifikasi sampah sekaligus tentukan apakah sampah tersebut benar-benar berada di lingkungan fisik atau hanya ditampilkan lewat media lain.
+function normalizeSeverity(rawLevel, score = 30) {
+  const val = String(rawLevel || '').toLowerCase().trim();
+  if (['critical', 'kritis', 'sangat_parah', 'sangat parah'].includes(val)) return 'critical';
+  if (['high', 'tinggi', 'parah', 'berat'].includes(val)) return 'high';
+  if (['medium', 'sedang', 'menengah'].includes(val)) return 'medium';
+  if (['low', 'rendah', 'ringan'].includes(val)) return 'low';
 
-Kembalikan HANYA JSON valid dengan struktur:
-{
-  "waste_detected": true,
-  "waste_categories": ["plastic"],
-  "image_type": "real_photo",
-  "waste_context": "physical_environment",
-  "capture_validity": "valid",
-  "description": "Deskripsi singkat objek yang terlihat",
-  "distribution": "concentrated",
-  "severity": "medium",
-  "environmental_risk": [],
-  "uncertainties": []
+  if (score >= 80) return 'critical';
+  if (score >= 60) return 'high';
+  if (score >= 38) return 'medium';
+  return 'low';
 }
 
-Nilai yang diizinkan:
-- image_type: real_photo | illustration | screenshot | printed_image | unknown
-- waste_context: physical_environment | device_screen | printed_surface | digital_content | unknown
-- capture_validity: valid | invalid | uncertain
-- waste_categories: plastic, paper_cardboard, organic, glass, metal, textile, e_waste, construction, hazardous, other, unknown
-- distribution: concentrated | scattered | unknown
-- severity: low | medium | high | unknown
+function computeLocalImpactScore(data) {
+  const level = String(data.level || '').toLowerCase();
+  const areaM2 = Number(data.luas_sampah_m2 || 0);
+  const pileAreaM2 = Number(data.luas_tumpukan_m2 || 0);
+  const count = Number(data.jumlah_objek || 0);
 
-Aturan:
-1. Sampah terlihat nyata di jalan, sungai, tanah, selokan, atau lahan: image_type=real_photo, waste_context=physical_environment, capture_validity=valid.
-2. Ilustrasi, gambar digital, screenshot, atau poster: capture_validity=invalid.
-3. Kamera memotret layar HP/laptop/TV yang menampilkan sampah: image_type=real_photo, waste_context=device_screen, capture_validity=invalid.
-4. Kamera memotret foto cetak/poster sampah: waste_context=printed_surface, capture_validity=invalid.
-5. Konteks tidak pasti: gunakan unknown, capture_validity=uncertain, jelaskan di uncertainties.
-6. Jangan menyatakan valid hanya karena ada sampah terlihat. Prioritaskan konteks keberadaan objek.
-7. Jika waste_detected=false: waste_categories dan environmental_risk kosong, severity low atau unknown, distribution unknown.
-8. Jangan mengarang berat atau volume. Severity dan risiko hanya perkiraan visual.`;
+  let base = 28;
+  if (level === 'berat') base = 75;
+  else if (level === 'sedang') base = 50;
 
-// Hasil palsu untuk demo / saat Gemini tidak tersedia. Selalu ditandai fallback: true
-function mockAnalysis() {
-  return {
-    waste_detected: true,
-    waste_categories: ['other'],
-    image_type: 'real_photo',
-    waste_context: 'physical_environment',
-    capture_validity: 'valid',
-    description: 'Tumpukan sampah terdeteksi di lokasi laporan (mode fallback, belum dianalisis AI).',
-    distribution: 'unknown',
-    severity: 'medium',
-    environmental_risk: [],
-    uncertainties: ['Hasil ini dibuat oleh mode fallback, bukan oleh model AI.'],
-    fallback: true
-  };
+  const areaBonus = Math.min(18, Math.round(areaM2 * 4 + pileAreaM2 * 5));
+  const countBonus = Math.min(7, Math.floor(count / 3));
+
+  return Math.min(100, Math.max(15, base + areaBonus + countBonus));
 }
 
-function statusOf(error) {
-  const code = Number(error?.status || error?.code || error?.response?.status);
-  if (code) return code;
-  const msg = String(error?.message || '').toLowerCase();
-  if (msg.includes('429') || msg.includes('resource_exhausted')) return 429;
-  if (msg.includes('503') || msg.includes('unavailable') || msg.includes('overloaded')) return 503;
-  return 500;
-}
+// 1. Model Lokal (best.onnx via api.py -> POST /analyze)
+async function analyzeWithLocalModel(fileBuffer, mimeType, filename = 'waste.jpg') {
+  const formData = new FormData();
+  const blob = new Blob([fileBuffer], { type: mimeType });
+  formData.append('foto', blob, filename);
 
-async function callGemini(buffer, mimeType) {
-  const response = await ai.models.generateContent({
-    model: env.GEMINI_MODEL,
-    contents: [PROMPT, { inlineData: { data: buffer.toString('base64'), mimeType } }],
-    config: { responseMimeType: 'application/json' }
+  const response = await fetch(LOCAL_AI_URL, {
+    method: 'POST',
+    body: formData
   });
 
-  const text = (response.text || '').replace(/```json|```/gi, '').trim();
-  const parsed = JSON.parse(text);
-
-  const validation = validateAiAnalysis(parsed);
-  if (!validation.valid) {
-    throw new Error(`Format hasil AI tidak sesuai: ${validation.errors.join('; ')}`);
-  }
-  return { raw: parsed, validation };
-}
-
-/**
- * Analisis foto sampah.
- * Mengembalikan objek siap pakai untuk reportController:
- *   has_waste, is_valid_capture, needs_admin_review, severity_level, impact_score, description, ai: {...}
- */
-async function analyzeWasteImage(buffer, mimeType) {
-  let raw;
-  let validation;
-  let fallback = false;
-
-  try {
-    if (!ai) throw new Error('GEMINI_API_KEY belum diisi.');
-    ({ raw, validation } = await callGemini(buffer, mimeType));
-  } catch (err) {
-    const status = statusOf(err);
-    console.warn(`[ai] Gemini gagal (${status}): ${err.message}`);
-
-    if (env.AI_FALLBACK_MODE === 'error') {
-      throw status === 429
-        ? new ApiError(429, 'Layanan AI sedang mencapai batas permintaan. Coba lagi beberapa saat.')
-        : ApiError.unavailable('Layanan analisis AI sedang tidak tersedia. Silakan coba lagi.');
-    }
-
-    raw = mockAnalysis();
-    validation = validateAiAnalysis(raw);
-    fallback = true;
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Local AI error (${response.status}): ${errText}`);
   }
 
-  const severity = SEVERITY_MAP[raw.severity] || SEVERITY_MAP.medium;
-  const eligible = validation.report_eligible && raw.waste_detected;
-  const needsReview = !eligible && validation.review_required && raw.waste_detected;
+  const data = await response.json();
+  const status = String(data.status || '').toLowerCase();
+  const jumlahObjek = Number(data.jumlah_objek || 0);
+  const alasanList = Array.isArray(data.alasan) ? data.alasan : [];
+  const objekList = Array.isArray(data.objek) ? data.objek : [];
+
+  const maxConf = objekList.length > 0
+    ? Math.max(...objekList.map((o) => Number(o.confidence || 0)))
+    : 0;
+
+  // KATEGORI 1: FOTO TIDAK JELAS (buram, gelap, terlalu terang, resolusi tidak pas)
+  if (status === 'foto_ulang') {
+    return {
+      source: 'local_onnx',
+      capture_category: 'invalid_photo',
+      is_valid_capture: false,
+      is_clean_location: false,
+      needs_admin_review: false,
+      severity_level: 'low',
+      impact_score: 0,
+      description: alasanList[0] || 'Foto tidak jelas (buram, goyang, atau pencahayaan kurang pas). Silakan ambil foto ulang.'
+    };
+  }
+
+  // KATEGORI 2: LOKASI BERSIH (kualitas foto tajam & jelas, tetapi 0 objek sampah)
+  if (jumlahObjek === 0) {
+    return {
+      source: 'local_onnx',
+      capture_category: 'clean_location',
+      is_valid_capture: false,
+      is_clean_location: true,
+      needs_admin_review: false,
+      severity_level: 'low',
+      impact_score: 0,
+      description: 'Lokasi terpantau bersih dan bebas dari tumpukan sampah.'
+    };
+  }
+
+  // KATEGORI 1B: Deteksi meragukan / bukan sampah (confidence rendah < 0.55) -> foto tidak sesuai
+  const lowConfidence = alasanList.some((a) => a.toLowerCase().includes('keyakinan model rendah')) || maxConf < 0.55;
+  if (lowConfidence) {
+    return {
+      source: 'local_onnx',
+      capture_category: 'invalid_photo',
+      is_valid_capture: false,
+      is_clean_location: false,
+      needs_admin_review: false,
+      severity_level: 'low',
+      impact_score: 0,
+      description: 'Objek pada foto tidak jelas atau tidak sesuai sebagai bukti sampah. Silakan coba foto lain.'
+    };
+  }
+
+  // KATEGORI 3: LOKASI KOTOR (sampah terdeteksi dengan yakin)
+  const impactScore = computeLocalImpactScore(data);
+  const severityLevel = normalizeSeverity(data.level, impactScore);
+  const kelasTerdeteksi = [...new Set(objekList.map((o) => o.kelas).filter(Boolean))].join(', ');
+  const labelTingkat = (data.level || 'sedang').toUpperCase();
 
   return {
-    has_waste: raw.waste_detected,
-    is_valid_capture: eligible || needsReview,
-    needs_admin_review: needsReview,
-    severity_level: severity.level,
-    impact_score: severity.score,
-    description: raw.description,
-    fallback,
-    detail: {
-      categories: raw.waste_categories,
-      image_type: raw.image_type,
-      waste_context: raw.waste_context,
-      capture_validity: raw.capture_validity,
-      distribution: raw.distribution,
-      environmental_risk: raw.environmental_risk,
-      uncertainties: raw.uncertainties
-    }
+    source: 'local_onnx',
+    capture_category: 'waste_detected',
+    is_valid_capture: true,
+    is_clean_location: false,
+    needs_admin_review: false,
+    severity_level: severityLevel,
+    impact_score: impactScore,
+    description: `Tingkat ${labelTingkat}: Terdeteksi ${jumlahObjek} objek sampah (${kelasTerdeteksi || 'campuran'}), perkiraan luas ${data.luas_sampah_m2 || 0} m².`
   };
+}
+
+// 2. Fungsi Utama: Gemini Utama + Otomatis Fallback ke Model Lokal
+async function analyzeWasteImage(fileBuffer, mimeType, filename = 'waste.jpg') {
+  try {
+    if (!env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY tidak dikonfigurasi.');
+    }
+
+    const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+    const base64Image = fileBuffer.toString('base64');
+
+    const prompt = `Periksa foto lapangan ini dan bedakan dengan tegas ke dalam 3 kategori:
+1. "invalid_photo": Jika foto goyang, buram, terlalu gelap/terang, tertutup jari, atau objek tidak jelas sehingga kondisi lingkungan tidak bisa dinilai.
+2. "clean_location": Jika foto tajam dan lingkungan terlihat jelas, namun area tersebut BERSIH (tidak ada sampah).
+3. "waste_detected": Jika terlihat tumpukan atau sebaran sampah dengan jelas.
+
+Kembalikan HANYA JSON valid:
+{
+  "capture_category": "invalid_photo" | "clean_location" | "waste_detected",
+  "severity_level": "low" | "medium" | "high" | "critical",
+  "impact_score": number (0 jika bersih/tidak jelas, 1-100 jika ada sampah),
+  "description": "penjelasan singkat kondisi foto"
+}`;
+
+    const response = await ai.models.generateContent({
+      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+      contents: [
+        prompt,
+        { inlineData: { data: base64Image, mimeType } }
+      ],
+      config: { responseMimeType: 'application/json' }
+    });
+
+    const parsed = JSON.parse(response.text);
+    const category = parsed.capture_category || 'invalid_photo';
+    const impactScore = Number(parsed.impact_score || 0);
+
+    return {
+      source: 'gemini',
+      capture_category: category,
+      is_valid_capture: category === 'waste_detected',
+      is_clean_location: category === 'clean_location',
+      needs_admin_review: false,
+      severity_level: category === 'waste_detected' ? normalizeSeverity(parsed.severity_level, impactScore) : 'low',
+      impact_score: category === 'waste_detected' ? Math.max(15, impactScore) : 0,
+      description: parsed.description || 'Tervalidasi.'
+    };
+  } catch (geminiError) {
+    console.warn('[AI Fallback] Beralih ke model lokal:', geminiError.message);
+    return await analyzeWithLocalModel(fileBuffer, mimeType, filename);
+  }
 }
 
 module.exports = { analyzeWasteImage };
