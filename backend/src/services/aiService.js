@@ -12,25 +12,34 @@ const LOCAL_AI_TIMEOUT_MS = Number(
 const VALID_CATEGORIES = [
   'invalid_photo',
   'clean_location',
-  'waste_detected'
+  'waste_detected',
+  'review_required'
 ];
 
-function normalizeSeverity(rawLevel, score = 30) {
-  const val = String(rawLevel || '').toLowerCase().trim();
+function clampScore(value, min = 0, max = 100) {
+  const number = Number(value);
 
-  if (['critical', 'kritis', 'sangat_parah', 'sangat parah'].includes(val)) {
+  if (!Number.isFinite(number)) return min;
+
+  return Math.min(max, Math.max(min, Math.round(number)));
+}
+
+function normalizeSeverity(rawLevel, score = 30) {
+  const value = String(rawLevel || '').toLowerCase().trim();
+
+  if (['critical', 'kritis', 'sangat_parah', 'sangat parah'].includes(value)) {
     return 'critical';
   }
 
-  if (['high', 'tinggi', 'parah', 'berat'].includes(val)) {
+  if (['high', 'tinggi', 'parah', 'berat'].includes(value)) {
     return 'high';
   }
 
-  if (['medium', 'sedang', 'menengah'].includes(val)) {
+  if (['medium', 'sedang', 'menengah'].includes(value)) {
     return 'medium';
   }
 
-  if (['low', 'rendah', 'ringan'].includes(val)) {
+  if (['low', 'rendah', 'ringan'].includes(value)) {
     return 'low';
   }
 
@@ -41,34 +50,39 @@ function normalizeSeverity(rawLevel, score = 30) {
   return 'low';
 }
 
-function clampScore(value, min = 0, max = 100) {
-  const number = Number(value);
-
-  if (!Number.isFinite(number)) return min;
-
-  return Math.min(max, Math.max(min, Math.round(number)));
-}
-
-function invalidPhotoResult(description) {
+function invalidPhotoResult(description, source = 'ai') {
   return {
-    source: 'ai',
+    source,
     capture_category: 'invalid_photo',
     is_valid_capture: false,
     is_clean_location: false,
-    needs_admin_review: false,
+    needs_admin_review: true,
     severity_level: 'low',
     impact_score: 0,
     description
   };
 }
 
-function cleanLocationResult(description) {
+function cleanLocationResult(description, source = 'ai') {
   return {
-    source: 'ai',
+    source,
     capture_category: 'clean_location',
-    is_valid_capture: false,
+    is_valid_capture: true,
     is_clean_location: true,
-    needs_admin_review: false,
+    needs_admin_review: true,
+    severity_level: 'low',
+    impact_score: 0,
+    description
+  };
+}
+
+function reviewRequiredResult(description, source = 'ai') {
+  return {
+    source,
+    capture_category: 'review_required',
+    is_valid_capture: false,
+    is_clean_location: false,
+    needs_admin_review: true,
     severity_level: 'low',
     impact_score: 0,
     description
@@ -111,6 +125,7 @@ async function analyzeWithLocalModel(
   formData.append('foto', blob, filename);
 
   const controller = new AbortController();
+
   const timeout = setTimeout(
     () => controller.abort(),
     LOCAL_AI_TIMEOUT_MS
@@ -129,13 +144,16 @@ async function analyzeWithLocalModel(
       throw new Error('Python AI timeout.');
     }
 
-    throw new Error(`Python AI tidak dapat dihubungi: ${error.message}`);
+    throw new Error(
+      `Python AI tidak dapat dihubungi: ${error.message}`
+    );
   } finally {
     clearTimeout(timeout);
   }
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => '');
+
     throw new Error(
       `Local AI error (${response.status}): ${errorText}`
     );
@@ -145,9 +163,11 @@ async function analyzeWithLocalModel(
 
   const status = String(data.status || '').toLowerCase();
   const jumlahObjek = Number(data.jumlah_objek || 0);
+
   const alasanList = Array.isArray(data.alasan)
     ? data.alasan
     : [];
+
   const objekList = Array.isArray(data.objek)
     ? data.objek
     : [];
@@ -158,28 +178,20 @@ async function analyzeWithLocalModel(
       )
     : 0;
 
-  // Foto tidak layak dianalisis.
   if (status === 'foto_ulang') {
-    return {
-      ...invalidPhotoResult(
-        alasanList[0] ||
-        'Foto tidak jelas. Silakan ambil foto ulang.'
-      ),
-      source: 'local_onnx'
-    };
+    return invalidPhotoResult(
+      alasanList[0] || 'Foto tidak jelas. Silakan ambil foto ulang.',
+      'local_onnx'
+    );
   }
 
-  // Tidak ditemukan objek sampah.
   if (jumlahObjek === 0) {
-    return {
-      ...cleanLocationResult(
-        'Lokasi terpantau bersih dan tidak ditemukan objek sampah.'
-      ),
-      source: 'local_onnx'
-    };
+    return cleanLocationResult(
+      'Model lokal tidak menemukan objek sampah. Laporan tetap menunggu pemeriksaan admin.',
+      'local_onnx'
+    );
   }
 
-  // Deteksi harus memiliki keyakinan minimal 0,55.
   const lowConfidence =
     alasanList.some((reason) =>
       String(reason).toLowerCase().includes('keyakinan model rendah')
@@ -188,15 +200,12 @@ async function analyzeWithLocalModel(
     maxConf < 0.55;
 
   if (lowConfidence) {
-    return {
-      ...invalidPhotoResult(
-        'Objek pada foto tidak cukup jelas untuk divalidasi. Silakan ambil foto ulang.'
-      ),
-      source: 'local_onnx'
-    };
+    return reviewRequiredResult(
+      'Objek pada foto belum cukup jelas untuk divalidasi. Perlu pemeriksaan admin.',
+      'local_onnx'
+    );
   }
 
-  // Sampah terdeteksi.
   const impactScore = computeLocalImpactScore(data);
   const severityLevel = normalizeSeverity(
     data.level,
@@ -212,7 +221,6 @@ async function analyzeWithLocalModel(
   ].join(', ');
 
   const labelLevel = String(data.level || 'sedang').toUpperCase();
-
   const estimatedArea = Number(data.luas_sampah_m2 || 0);
 
   return {
@@ -220,13 +228,18 @@ async function analyzeWithLocalModel(
     capture_category: 'waste_detected',
     is_valid_capture: true,
     is_clean_location: false,
-    needs_admin_review: false,
+
+    // ONNX saat ini belum memvalidasi foto layar, poster,
+    // ilustrasi, atau media cetak secara khusus.
+    // Karena itu, hasilnya tetap perlu pemeriksaan admin.
+    needs_admin_review: true,
+
     severity_level: severityLevel,
     impact_score: impactScore,
     description:
       `Tingkat ${labelLevel}: Terdeteksi ${jumlahObjek} objek sampah ` +
       `(${detectedClasses || 'campuran'}), perkiraan luas ` +
-      `${estimatedArea} m².`
+      `${estimatedArea} m². Hasil memerlukan verifikasi admin.`
   };
 }
 
@@ -234,10 +247,7 @@ async function analyzeWithLocalModel(
 // 2. AI UTAMA: GEMINI
 // =====================================================
 
-async function analyzeWithGemini(
-  fileBuffer,
-  mimeType
-) {
+async function analyzeWithGemini(fileBuffer, mimeType) {
   if (!env.GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY tidak dikonfigurasi.');
   }
@@ -249,49 +259,75 @@ async function analyzeWithGemini(
   const base64Image = fileBuffer.toString('base64');
 
   const prompt = `
-Analisis foto lingkungan untuk mendeteksi keberadaan sampah.
+Kamu adalah sistem validasi foto untuk aplikasi pelaporan sampah lingkungan.
 
-Tentukan tepat satu kategori:
+Tujuan utama:
+Menentukan apakah foto menunjukkan sampah yang benar-benar berada
+di lingkungan fisik dan layak menjadi bukti laporan.
 
-1. invalid_photo:
-   Foto buram, goyang, terlalu gelap, terlalu terang,
-   tertutup, atau kondisi lingkungan tidak dapat dinilai.
+Pilih tepat satu kategori:
 
-2. clean_location:
-   Foto jelas dan kondisi lingkungan terlihat,
-   tetapi tidak ditemukan sampah.
+1. invalid_photo
+Foto buram, terlalu gelap, terlalu terang, goyang, tertutup,
+atau objek lingkungan tidak dapat dinilai.
 
-3. waste_detected:
-   Terlihat sampah nyata di lingkungan, baik berupa
-   tumpukan maupun sampah yang tersebar.
+2. clean_location
+Foto lingkungan nyata terlihat jelas, tetapi tidak ditemukan sampah.
 
-Perhatikan bahwa objek sampah harus terlihat cukup jelas.
-Jangan menyimpulkan adanya sampah hanya dari objek yang
-tidak dapat dikenali.
+3. waste_detected
+Sampah nyata terlihat berada di lingkungan fisik.
 
-Berikan severity:
+4. review_required
+Foto meragukan, tidak dapat dipastikan sebagai kondisi lingkungan nyata,
+atau memerlukan pemeriksaan manusia.
+
+ATURAN VALIDASI YANG SANGAT PENTING:
+
+A. BUKAN SAMPAH NYATA:
+- Foto sampah yang hanya tampil pada layar HP.
+- Foto sampah yang tampil pada layar laptop atau komputer.
+- Foto sampah yang tampil pada layar tablet atau televisi.
+- Screenshot, gambar digital, atau foto dari galeri yang ditampilkan
+  pada perangkat lain.
+- Poster, brosur, majalah, koran, atau media cetak yang menggambarkan sampah.
+- Ilustrasi, lukisan, gambar kartun, desain grafis, atau render digital.
+
+B. Jika sampah hanya terlihat sebagai gambar pada layar atau media cetak,
+jangan klasifikasikan sebagai waste_detected.
+
+C. Jika tidak yakin apakah sampah benar-benar berada di lingkungan fisik,
+gunakan review_required.
+
+D. Jangan menganggap bayangan, pola, tekstur, atau objek yang tidak jelas
+sebagai sampah.
+
+E. Jangan membuat asumsi lokasi, jenis, atau jumlah sampah yang tidak terlihat.
+
+Tingkat keparahan:
 - low
 - medium
 - high
 - critical
 
-Berikan impact_score berupa angka 0 sampai 100.
-Jika foto invalid atau lokasi bersih, impact_score harus 0.
+Impact score:
+Angka 0 sampai 100.
+Jika bukan waste_detected, berikan nilai 0.
 
 Kembalikan HANYA JSON valid dengan format:
+
 {
-  "capture_category": "invalid_photo",
+  "capture_category": "review_required",
   "severity_level": "low",
   "impact_score": 0,
-  "description": "Penjelasan singkat hasil analisis"
+  "description": "Alasan singkat hasil analisis"
 }
 
-Nilai capture_category harus salah satu dari:
-invalid_photo, clean_location, waste_detected.
+capture_category hanya boleh:
+invalid_photo, clean_location, waste_detected, review_required.
 `;
 
   const response = await ai.models.generateContent({
-    model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+    model: env.GEMINI_MODEL || 'gemini-2.5-flash',
     contents: [
       prompt,
       {
@@ -310,7 +346,13 @@ invalid_photo, clean_location, waste_detected.
     throw new Error('Gemini memberikan respons kosong.');
   }
 
-  const parsed = JSON.parse(response.text);
+  let parsed;
+
+  try {
+    parsed = JSON.parse(response.text);
+  } catch {
+    throw new Error('Respons Gemini bukan JSON yang valid.');
+  }
 
   const category = String(
     parsed.capture_category || ''
@@ -320,28 +362,26 @@ invalid_photo, clean_location, waste_detected.
     throw new Error('Kategori hasil Gemini tidak valid.');
   }
 
+  const description = String(
+    parsed.description || 'Analisis foto selesai.'
+  ).slice(0, 1000);
+
   const impactScore = clampScore(
     parsed.impact_score,
     0,
     100
   );
 
-  const description = String(
-    parsed.description || 'Analisis foto selesai.'
-  ).slice(0, 1000);
-
   if (category === 'invalid_photo') {
-    return {
-      ...invalidPhotoResult(description),
-      source: 'gemini'
-    };
+    return invalidPhotoResult(description, 'gemini');
   }
 
   if (category === 'clean_location') {
-    return {
-      ...cleanLocationResult(description),
-      source: 'gemini'
-    };
+    return cleanLocationResult(description, 'gemini');
+  }
+
+  if (category === 'review_required') {
+    return reviewRequiredResult(description, 'gemini');
   }
 
   return {
@@ -392,7 +432,7 @@ async function analyzeWasteImage(
       );
 
       throw new Error(
-        'Layanan AI sedang tidak tersedia. Silakan coba beberapa saat lagi.'
+        'Layanan AI sedang tidak tersedia.'
       );
     }
   }
@@ -400,5 +440,6 @@ async function analyzeWasteImage(
 
 module.exports = {
   analyzeWasteImage,
-  analyzeWithLocalModel
+  analyzeWithLocalModel,
+  analyzeWithGemini
 };

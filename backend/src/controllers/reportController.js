@@ -1,199 +1,192 @@
-  const { supabaseAdmin } = require('../config/supabase');
-  const env = require('../config/env');
-  const { uploadPrivateImage, removeFile, getSignedImageUrl } = require('../services/storageService');
-  const { analyzeWasteImage } = require('../services/aiService');
-  const { calculateDistanceMeters } = require('../utils/geoUtils');
-  const asyncHandler = require('../utils/asyncHandler');
-  const ApiError = require('../utils/ApiError');
 
-  const MERGE_RADIUS_M = 30; // laporan sedekat ini otomatis ditautkan ke hotspot aktif
+const { supabaseAdmin } = require('../config/supabase');
+const env = require('../config/env');
+const {
+  uploadPrivateImage,
+  removeFile,
+  getSignedImageUrl
+} = require('../services/storageService');
+const { analyzeWasteImage } = require('../services/aiService');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
 
-  function findNearestHotspot(hotspots, lat, lng) {
-    let best = null;
-    let bestDistance = Infinity;
-    for (const hs of hotspots) {
-      const d = calculateDistanceMeters(lat, lng, hs.latitude, hs.longitude);
-      if (d <= MERGE_RADIUS_M && d < bestDistance) {
-        best = hs;
-        bestDistance = d;
-      }
-    }
-    return { hotspot: best, distance: bestDistance };
-  }
+function buildFallbackAIResult(error) {
+  return {
+    source: 'unavailable',
+    capture_category: 'review_required',
+    is_valid_capture: false,
+    is_clean_location: false,
+    needs_admin_review: true,
+    severity_level: 'low',
+    impact_score: 0,
+    description: 'Analisis AI belum dapat dilakukan. Laporan menunggu pemeriksaan admin.',
+    error_message: error?.message || 'AI service unavailable'
+  };
+}
 
-  // Hitung ulang tingkat keparahan hotspot berdasarkan seluruh foto dari berbagai sudut & jarak
-  async function recalculateHotspotSeverity(hotspotId) {
-    const { data: reports, error } = await supabaseAdmin
-      .from('reports')
-      .select('id, latitude, longitude, severity_level, impact_score, created_at')
-      .eq('hotspot_id', hotspotId)
-      .neq('status', 'rejected');
+function createReportTitle(description, aiDescription) {
+  const source = String(description || aiDescription || '').trim();
 
-    if (error || !reports || reports.length === 0) return null;
+  if (!source) return 'Laporan sampah baru';
 
-    const fallbackScoreMap = {
-      low: 25,
-      medium: 50,
-      high: 75,
-      critical: 95
-    };
+  return source.length > 120
+    ? `${source.slice(0, 117)}...`
+    : source;
+}
 
-    let maxPhotoScore = 0;
-    let totalScore = 0;
+exports.createReport = asyncHandler(async (req, res) => {
+  const file = req.file;
 
-    for (const r of reports) {
-      const score = Number(r.impact_score) || fallbackScoreMap[r.severity_level] || 25;
-      if (score > maxPhotoScore) maxPhotoScore = score;
-      totalScore += score;
-    }
-
-    const avgPhotoScore = totalScore / reports.length;
-
-    // Hitung sebaran jarak terjauh antar sudut foto pada lokasi yang sama
-    let maxSpreadMeters = 0;
-    for (let i = 0; i < reports.length; i++) {
-      for (let j = i + 1; j < reports.length; j++) {
-        const dist = calculateDistanceMeters(
-          reports[i].latitude,
-          reports[i].longitude,
-          reports[j].latitude,
-          reports[j].longitude
-        );
-        if (dist > maxSpreadMeters) maxSpreadMeters = dist;
-      }
-    }
-
-    // Formula Gabungan Multi-Sudut:
-    // - 60% dari titik terparah (menjaga bobot tumpukan utama di bawah pohon)
-    // - 25% dari rata-rata kepadatan seluruh sudut foto
-    // - Bonus jumlah sudut foto (+5 per foto tambahan, maks +15) & bonus sebaran area (>=8m = +5)
-    const angleBonus = Math.min((reports.length - 1) * 5, 15);
-    const spreadBonus = maxSpreadMeters >= 8 ? 5 : 0;
-
-    const combinedScore = Math.min(
-      100,
-      Math.round(maxPhotoScore * 0.6 + avgPhotoScore * 0.25 + angleBonus + spreadBonus)
+  if (!file) {
+    throw ApiError.badRequest(
+      'Foto bukti wajib diambil langsung dari kamera.'
     );
-
-    let priorityLevel = 'low';
-    if (combinedScore >= 80) priorityLevel = 'critical';
-    else if (combinedScore >= 60) priorityLevel = 'high';
-    else if (combinedScore >= 38) priorityLevel = 'medium';
-
-    const { data: updatedHotspot } = await supabaseAdmin
-      .from('hotspots')
-      .update({
-        priority_level: priorityLevel,
-        priority_score: combinedScore,
-        last_verified_at: new Date().toISOString()
-      })
-      .eq('id', hotspotId)
-      .select('id, title, latitude, longitude, priority_score, priority_level')
-      .single();
-
-    return updatedHotspot;
   }
 
-  exports.createReport = asyncHandler(async (req, res) => {
-    const file = req.file;
-    if (!file) throw ApiError.badRequest('Foto bukti wajib diambil langsung dari kamera.');
+  const latitude = Number(req.body.latitude);
+  const longitude = Number(req.body.longitude);
 
-    const latitude = parseFloat(req.body.latitude);
-    const longitude = parseFloat(req.body.longitude);
-    const { gps_accuracy_m, location_captured_at, description } = req.body;
-    const capturedAt = location_captured_at || new Date().toISOString();
+  if (
+    !Number.isFinite(latitude) ||
+    latitude < -90 ||
+    latitude > 90 ||
+    !Number.isFinite(longitude) ||
+    longitude < -180 ||
+    longitude > 180
+  ) {
+    throw ApiError.badRequest('Koordinat GPS tidak valid.');
+  }
 
-    // 1. Analisis AI (Gemini utama, otomatis fallback ke model lokal best.onnx jika error/kuota habis)
-    const ai = await analyzeWasteImage(file.buffer, file.mimetype, file.originalname);
+  const description = String(req.body.description || '').trim();
+  const capturedAt = req.body.location_captured_at || new Date().toISOString();
 
-    if (!ai.is_valid_capture) {
-      return res.status(200).json({
-        success: true,
-        rejected_by_ai: true,
-        reason: ai.description || 'Foto tidak valid atau tidak ditemukan tumpukan sampah.'
-      });
-    }
+  // 1. Simpan foto terlebih dahulu.
+  // Laporan tetap bisa disimpan meskipun layanan AI sedang tidak tersedia.
+  const folder = req.user?.id || 'guest-public';
 
-    // 2. Cari hotspot terdekat dalam radius 30m
-    const { data: activeHotspots } = await supabaseAdmin
-      .from('hotspots')
-      .select('id, title, latitude, longitude, priority_score, priority_level')
-      .neq('status', 'resolved');
-    const matched = findNearestHotspot(activeHotspots || [], latitude, longitude);
-    const { hotspot, distance } = matched;
+  const storagePath = await uploadPrivateImage(
+    env.BUCKET_REPORTS,
+    file.buffer,
+    file.mimetype,
+    folder
+  );
 
-    // 3. Simpan foto, lalu laporan. Jika langkah berikutnya gagal, foto dibersihkan.
-    const folder = req.user?.id || 'guest-public';
-    const storagePath = await uploadPrivateImage(env.BUCKET_REPORTS, file.buffer, file.mimetype, folder);
+  try {
+    // 2. Jalankan AI. Jika gagal, laporan tetap dilanjutkan sebagai pending.
+    let ai;
 
     try {
-      const status = hotspot ? 'verified' : 'analysis_completed';
-
-      // Simpan koordinat asli sudut pengambilan foto agar jarak sebaran multi-foto dapat dihitung
-      const { data: report, error: reportErr } = await supabaseAdmin
-        .from('reports')
-        .insert({
-          reporter_id: req.user?.id || null,
-          hotspot_id: hotspot ? hotspot.id : null,
-          latitude,
-          longitude,
-          gps_accuracy_m,
-          location_captured_at: capturedAt,
-          description: description || ai.description,
-          severity_level: ai.severity_level,
-          impact_score: ai.impact_score,
-          status
-        })
-        .select()
-        .single();
-      if (reportErr) throw reportErr;
-
-      const { error: imageErr } = await supabaseAdmin.from('report_images').insert({
-        report_id: report.id,
-        storage_path: storagePath,
-        mime_type: file.mimetype,
-        size_bytes: file.size,
-        captured_at: capturedAt
-      });
-      if (imageErr) {
-        await supabaseAdmin.from('reports').delete().eq('id', report.id);
-        throw imageErr;
-      }
-
-      // 4. Gabungkan seluruh data foto di titik lokasi ini untuk memperbarui tingkat keparahan wilayah
-      let updatedHotspot = hotspot;
-      if (hotspot) {
-        updatedHotspot = (await recalculateHotspotSeverity(hotspot.id)) || hotspot;
-      }
-
-      res.status(201).json({
-        success: true,
-        report,
-        merged_location: Boolean(hotspot),
-        matched_hotspot: updatedHotspot,
-        distance_m: hotspot ? Math.round(distance) : null,
-        needs_review: ai.needs_admin_review,
-        ai
-      });
-    } catch (err) {
-      await removeFile(env.BUCKET_REPORTS, storagePath);
-      throw err;
+      ai = await analyzeWasteImage(
+        file.buffer,
+        file.mimetype,
+        file.originalname
+      );
+    } catch (aiError) {
+      console.error('[Report] Analisis AI gagal:', aiError.message);
+      ai = buildFallbackAIResult(aiError);
     }
-  });
 
-  exports.getMyReports = asyncHandler(async (req, res) => {
-    const { data, error } = await supabaseAdmin
-      .from('reports')
-      .select('*, report_images (storage_path)')
-      .eq('reporter_id', req.user.id)
-      .order('created_at', { ascending: false });
-    if (error) throw error;
-
-    const reports = await Promise.all(
-      data.map(async (item) => ({
-        ...item,
-        photo_url: await getSignedImageUrl(env.BUCKET_REPORTS, item.report_images?.[0]?.storage_path)
-      }))
+    // 3. Semua laporan baru menunggu pemeriksaan admin.
+    // Tidak membuat atau menggabungkan hotspot secara otomatis.
+    const reportTitle = createReportTitle(
+      description,
+      ai.description
     );
-    res.json({ success: true, reports });
+
+    const aiIsValidWaste =
+      ai.source === 'unavailable' || ai.needs_admin_review
+        ? null
+        : ai.capture_category === 'waste_detected';
+
+    const aiSeverity = [
+      'low',
+      'medium',
+      'high',
+      'critical'
+    ].includes(ai.severity_level)
+      ? ai.severity_level
+      : 'low';
+
+    const { data: report, error: reportError } = await supabaseAdmin
+      .from('reports')
+      .insert({
+        reporter_id: req.user?.id || null,
+        hotspot_id: null,
+        title: reportTitle,
+        description: description || ai.description || null,
+        latitude,
+        longitude,
+        photo_path: storagePath,
+        ai_is_valid_waste: aiIsValidWaste,
+        ai_waste_types: [],
+        ai_severity: aiSeverity,
+        ai_estimated_weight_kg: 0,
+        ai_summary: ai.description || 'Menunggu pemeriksaan admin.',
+        status: 'pending'
+      })
+      .select()
+      .single();
+
+    if (reportError) {
+      throw reportError;
+    }
+
+    // 4. Berikan URL foto sementara kepada frontend.
+    const photoUrl = await getSignedImageUrl(
+      env.BUCKET_REPORTS,
+      storagePath
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: 'Laporan berhasil dikirim dan menunggu pemeriksaan admin.',
+      report: {
+        ...report,
+        photo_url: photoUrl
+      },
+      ai: {
+        source: ai.source,
+        capture_category: ai.capture_category,
+        is_valid_capture: ai.is_valid_capture,
+        needs_admin_review: ai.needs_admin_review,
+        severity_level: ai.severity_level,
+        impact_score: ai.impact_score,
+        description: ai.description
+      },
+      needs_review: true,
+      merged_location: false,
+      matched_hotspot: null
+    });
+  } catch (error) {
+    // Hapus foto jika penyimpanan laporan gagal.
+    await removeFile(env.BUCKET_REPORTS, storagePath);
+    throw error;
+  }
+});
+
+exports.getMyReports = asyncHandler(async (req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('reports')
+    .select('*')
+    .eq('reporter_id', req.user.id)
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+
+  const reports = await Promise.all(
+    (data || []).map(async (report) => ({
+      ...report,
+      photo_url: report.photo_path
+        ? await getSignedImageUrl(
+            env.BUCKET_REPORTS,
+            report.photo_path
+          )
+        : null
+    }))
+  );
+
+  return res.json({
+    success: true,
+    reports
   });
+});
