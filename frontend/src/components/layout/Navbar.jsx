@@ -1,7 +1,21 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 
 export default function Navbar({ activePage, onNavigate, user }) {
+  const [menuOpen, setMenuOpen] = useState(false);
   const isVolunteer = user?.role === 'volunteer';
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') setMenuOpen(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  const navigate = (pageName) => {
+    setMenuOpen(false);
+    onNavigate(pageName);
+  };
 
   const navLinkStyle = (pageName) => ({
     padding: '9px 14px',
@@ -23,20 +37,45 @@ export default function Navbar({ activePage, onNavigate, user }) {
         </button>
 
         <nav className="desktop-nav" aria-label="Navigasi utama">
-          <button onClick={() => onNavigate('map')} style={navLinkStyle('map')}>Peta Hotspot</button>
-          <button onClick={() => onNavigate('report')} style={navLinkStyle('report')}>Laporkan Sampah</button>
-          <button onClick={() => onNavigate('volunteer')} style={navLinkStyle('volunteer')}>
+          <button onClick={() => navigate('map')} style={navLinkStyle('map')}>Peta Hotspot</button>
+          <button onClick={() => navigate('report')} style={navLinkStyle('report')}>Laporkan Sampah</button>
+          <button onClick={() => navigate('volunteer')} style={navLinkStyle('volunteer')}>
             Sukarelawan
           </button>
         </nav>
 
         <button
           className="nav-cta"
-          onClick={() => onNavigate(isVolunteer ? 'volunteer' : 'report')}
+          onClick={() => navigate(isVolunteer ? 'volunteer' : 'report')}
         >
           <span>{isVolunteer ? 'Dashboard Relawan' : 'Mulai Sekarang'}</span>
           <span className="cta-arrow">↗</span>
         </button>
+
+        <button
+          className={`nav-menu-toggle${menuOpen ? ' is-open' : ''}`}
+          type="button"
+          aria-label={menuOpen ? 'Tutup menu navigasi' : 'Buka menu navigasi'}
+          aria-controls="mobile-navigation"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((open) => !open)}
+        >
+          <span />
+          <span />
+          <span />
+        </button>
+
+        <nav
+          id="mobile-navigation"
+          className={`mobile-nav${menuOpen ? ' is-open' : ''}`}
+          aria-label="Navigasi utama"
+        >
+          <button onClick={() => navigate('map')} style={navLinkStyle('map')}>Peta Hotspot</button>
+          <button onClick={() => navigate('report')} style={navLinkStyle('report')}>Laporkan Sampah</button>
+          <button onClick={() => navigate('volunteer')} style={navLinkStyle('volunteer')}>
+            Sukarelawan
+          </button>
+        </nav>
       </div>
     </header>
   );
