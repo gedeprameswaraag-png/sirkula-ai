@@ -1,157 +1,133 @@
-const { createClient } = require('@supabase/supabase-js');
-const { supabaseAdmin } = require('../config/supabase');
 
-// Client publik (anon) khusus untuk memicu alur signUp & verifikasi email resmi Supabase
-const supabasePublic = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+const authService = require('../services/authService');
 
-exports.registerVolunteer = async (payload) => {
-  const {
-    full_name,
-    email,
-    password,
-    age,
-    phone,
-    medical_history,
-    health_declaration
-  } = payload;
+// ==========================================
+// LOGIN UMUM
+// ==========================================
 
-  if (!full_name || !email || !password) {
-    const err = new Error('Nama lengkap, email aktif, dan kata sandi wajib diisi.');
-    err.statusCode = 400;
-    throw err;
+exports.login = async (req, res, next) => {
+  try {
+    const result = await authService.login(req.body);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Login berhasil.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
   }
-
-  if (!health_declaration) {
-    const err = new Error('Anda wajib menyetujui pernyataan sehat jasmani dan siap bekerja di lapangan.');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  const cleanEmail = email.trim().toLowerCase();
-
-  // Blokir domain email dummy/sekali pakai yang umum
-  const blockedDomains = ['example.com', 'test.com', 'dummy.com', 'mailinator.com', 'tempmail.com', 'yopmail.com'];
-  const emailDomain = cleanEmail.split('@')[1] || '';
-  if (!emailDomain || blockedDomains.includes(emailDomain)) {
-    const err = new Error('Gunakan alamat email asli yang aktif (email dummy/sementara tidak diperbolehkan).');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  // 1. Daftarkan via signUp agar Supabase mengirim link verifikasi ke email asli
-  const { data: signUpData, error: signUpErr } = await supabasePublic.auth.signUp({
-    email: cleanEmail,
-    password,
-    options: {
-      emailRedirectTo: process.env.FRONTEND_URL || 'http://localhost:5173',
-      data: {
-        full_name: full_name.trim(),
-        role: 'volunteer'
-      }
-    }
-  });
-
-  if (signUpErr) {
-    const err = new Error(signUpErr.message);
-    err.statusCode = 400;
-    throw err;
-  }
-
-  // Supabase mengembalikan user dengan identities kosong jika email sudah terdaftar
-  if (!signUpData?.user || (signUpData.user.identities && signUpData.user.identities.length === 0)) {
-    const err = new Error('Email ini sudah terdaftar. Silakan cek kotak masuk email Anda atau langsung masuk.');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  // 2. Simpan biodata relawan ke tabel profiles (menunggu verifikasi email & Admin)
-  const { data: profile, error: profErr } = await supabaseAdmin
-    .from('profiles')
-    .upsert({
-      id: signUpData.user.id,
-      email: cleanEmail,
-      full_name: full_name.trim(),
-      role: 'volunteer',
-      age: age ? Number(age) : null,
-      phone: phone?.trim() || null,
-      medical_history: medical_history?.trim() || 'Tidak ada',
-      health_declaration: Boolean(health_declaration),
-      volunteer_status: 'pending_verification',
-      is_active: false
-    })
-    .select()
-    .single();
-
-  if (profErr) {
-    // Rollback user auth jika gagal simpan profil
-    await supabaseAdmin.auth.admin.deleteUser(signUpData.user.id).catch(() => {});
-    throw profErr;
-  }
-
-  return {
-    requires_email_verification: true,
-    email: cleanEmail,
-    user: profile
-  };
 };
 
-exports.login = async ({ email, password }, { allowedRoles } = {}) => {
-  if (!email || !password) {
-    const err = new Error('Email dan kata sandi wajib diisi.');
-    err.statusCode = 400;
-    throw err;
+// ==========================================
+// LOGIN VOLUNTEER
+// ==========================================
+
+exports.loginVolunteer = async (req, res, next) => {
+  try {
+    const result = await authService.login(req.body, {
+      allowedRoles: ['volunteer']
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Login relawan berhasil.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
   }
+};
 
-  const cleanEmail = email.trim().toLowerCase();
+// ==========================================
+// LOGIN ADMIN
+// ==========================================
 
-  const { data, error } = await supabasePublic.auth.signInWithPassword({
-    email: cleanEmail,
-    password
-  });
+exports.loginAdmin = async (req, res, next) => {
+  try {
+    const result = await authService.login(req.body, {
+      allowedRoles: ['admin', 'super_admin']
+    });
 
-  if (error) {
-    if (error.message.toLowerCase().includes('email not confirmed')) {
-      const err = new Error('Email Anda belum diverifikasi. Silakan buka kotak masuk/spam email Anda dan klik tautan verifikasi terlebih dahulu.');
-      err.statusCode = 403;
-      throw err;
-    }
-    const err = new Error('Email atau kata sandi salah.');
-    err.statusCode = 401;
-    throw err;
+    return res.status(200).json({
+      success: true,
+      message: 'Login admin berhasil.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
   }
+};
 
-  // Pastikan email benar-benar sudah terkonfirmasi
-  if (!data.user?.email_confirmed_at) {
-    const err = new Error('Email Anda belum diverifikasi. Silakan klik tautan verifikasi yang dikirim ke email Anda.');
-    err.statusCode = 403;
-    throw err;
+// ==========================================
+// REGISTER VOLUNTEER
+// ==========================================
+
+exports.registerVolunteer = async (req, res, next) => {
+  try {
+    const result = await authService.registerVolunteer(req.body);
+
+    return res.status(201).json({
+      success: true,
+      message:
+        'Pendaftaran berhasil. Silakan periksa email untuk verifikasi.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
   }
+};
 
-  const { data: profile, error: profErr } = await supabaseAdmin
-    .from('profiles')
-    .select('*')
-    .eq('id', data.user.id)
-    .single();
+// ==========================================
+// REFRESH TOKEN
+// ==========================================
 
-  if (profErr || !profile) {
-    const err = new Error('Profil pengguna tidak ditemukan.');
-    err.statusCode = 404;
-    throw err;
+exports.refresh = async (req, res, next) => {
+  try {
+    const { refresh_token } = req.body;
+
+    const result = await authService.refresh(refresh_token);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Token berhasil diperbarui.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
   }
+};
 
-  if (allowedRoles && !allowedRoles.includes(profile.role)) {
-    const err = new Error('Akun Anda tidak memiliki izin akses untuk portal ini.');
-    err.statusCode = 403;
-    throw err;
+// ==========================================
+// LOGOUT
+// ==========================================
+
+exports.logout = async (req, res, next) => {
+  try {
+    const result = await authService.logout(req.token);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Logout berhasil.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
   }
+};
 
-  return {
-    session: data.session,
-    access_token: data.session.access_token,
-    refresh_token: data.session.refresh_token,
-    user: profile
-  };
+// ==========================================
+// GET CURRENT USER
+// ==========================================
+
+exports.me = async (req, res, next) => {
+  try {
+    return res.status(200).json({
+      success: true,
+      message: 'Data pengguna berhasil diambil.',
+      data: req.user
+    });
+  } catch (error) {
+    next(error);
+  }
 };
