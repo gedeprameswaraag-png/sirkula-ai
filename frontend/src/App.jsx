@@ -6,6 +6,7 @@ import VolunteerAuthPage from './components/VolunteerAuthPage.jsx';
 import VolunteerDashboard from './components/VolunteerDashboard.jsx';
 import AdminPortal from './components/AdminPortal.jsx';
 import { sessionApi, publicApi } from './api.js';
+import { supabase } from './supabaseClient.js';
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -13,8 +14,34 @@ export default function App() {
   const [page, setPage] = useState(() => (window.location.hash === '#admin' ? 'admin' : 'map'));
   const [pos, setPos] = useState(null);
   const [geoError, setGeoError] = useState('');
+  const [authNotice, setAuthNotice] = useState(null);
 
-  // 1. Dengarkan perubahan URL (#admin) agar langsung berpindah tanpa perlu reload halaman
+  // Titik lokasi yang dipilih dari Dashboard Relawan untuk langsung dibuka di Peta
+  const [focusedZone, setFocusedZone] = useState(null);
+
+  // 1. Tangkap callback URL dari link konfirmasi email Supabase
+  useEffect(() => {
+    const hash = window.location.hash || '';
+    if (hash.includes('error_code=otp_expired') || hash.includes('error=access_denied')) {
+      setAuthNotice({
+        type: 'error',
+        message: 'Tautan verifikasi email sudah kedaluwarsa atau tidak valid. Silakan kirim ulang tautan verifikasi baru.'
+      });
+      setPage('volunteer');
+      window.history.replaceState(null, '', window.location.pathname);
+    } else if (hash.includes('access_token=') && hash.includes('type=signup')) {
+      supabase.auth.signOut().finally(() => {
+        setAuthNotice({
+          type: 'success',
+          message: 'Email berhasil dikonfirmasi! Silakan masuk menggunakan email dan kata sandi Anda.'
+        });
+        setPage('volunteer');
+        window.history.replaceState(null, '', window.location.pathname);
+      });
+    }
+  }, []);
+
+  // 2. Dengarkan perubahan URL (#admin)
   useEffect(() => {
     const handleHashChange = () => {
       if (window.location.hash === '#admin') {
@@ -25,7 +52,7 @@ export default function App() {
     return () => window.removeEventListener('hashchange', handleHashChange);
   }, []);
 
-  // 2. Pulihkan session login (baik Relawan maupun Admin tetap login saat refresh)
+  // 3. Pulihkan session login saat refresh
   useEffect(() => {
     sessionApi.getSessionProfile().then((profile) => {
       setUser(profile);
@@ -39,7 +66,7 @@ export default function App() {
     });
   }, []);
 
-  // 3. Pantau lokasi GPS perangkat
+  // 4. Pantau lokasi GPS perangkat
   useEffect(() => {
     if (!navigator.geolocation) {
       setGeoError('Perangkat tidak mendukung GPS.');
@@ -59,6 +86,7 @@ export default function App() {
   const handleLogout = async () => {
     await sessionApi.logout();
     setUser(null);
+    setFocusedZone(null);
     window.location.hash = '';
     setPage('map');
   };
@@ -71,7 +99,6 @@ export default function App() {
     );
   }
 
-  // Portal Admin berdiri sendiri & tetap mempertahankan sesi login Admin
   if (page === 'admin') {
     return (
       <AdminPortal
@@ -93,7 +120,10 @@ export default function App() {
   return (
     <MainLayout
       activePage={page}
-      onNavigate={(targetPage) => setPage(targetPage)}
+      onNavigate={(targetPage) => {
+        if (targetPage !== 'map') setFocusedZone(null);
+        setPage(targetPage);
+      }}
       user={user}
       onOpenAdmin={() => {
         window.location.hash = 'admin';
@@ -101,7 +131,17 @@ export default function App() {
       }}
     >
       {page === 'map' && (
-        <MapPage goReport={() => setPage('report')} />
+        <MapPage
+          currentUser={user}
+          focusedZone={focusedZone}
+          onClearFocusedZone={() => setFocusedZone(null)}
+          goReport={() => setPage('report')}
+          goVolunteerAuth={() => setPage('volunteer')}
+          onTaskClaimed={() => {
+            setFocusedZone(null);
+            setPage('volunteer');
+          }}
+        />
       )}
 
       {page === 'report' && (
@@ -115,16 +155,23 @@ export default function App() {
 
       {page === 'volunteer' && (
         user?.role === 'volunteer' ? (
-          <VolunteerDashboard currentUser={user} onLogout={handleLogout} />
+          <VolunteerDashboard
+            currentUser={user}
+            onLogout={handleLogout}
+            onSelectHotspotOnMap={(zone) => {
+              setFocusedZone(zone);
+              setPage('map');
+            }}
+          />
         ) : (
           <VolunteerAuthPage
-            onRegister={(formPayload) =>
-              publicApi.registerVolunteer(formPayload).then((newProfile) => {
-                setUser(newProfile);
-              })
-            }
+            initialNotice={authNotice}
+            onClearNotice={() => setAuthNotice(null)}
+            onRegister={(formPayload) => publicApi.registerVolunteer(formPayload)}
+            onResendEmail={(email) => publicApi.resendVerificationEmail(email)}
             onLogin={(email, password) =>
               sessionApi.login(email, password).then(({ user: loggedProfile }) => {
+                setAuthNotice(null);
                 setUser(loggedProfile);
               })
             }

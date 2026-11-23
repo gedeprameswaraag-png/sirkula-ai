@@ -33,17 +33,19 @@ async function requestApi(endpoint, options = {}) {
 // === SESSION & ROLE ===
 export const sessionApi = {
   async login(email, password) {
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    // Bersihkan cache sesi lama agar status konfirmasi email terbaru langsung terbaca
+    await supabase.auth.signOut().catch(() => {});
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.trim().toLowerCase(),
+      password
+    });
+
     if (error) {
       if (error.message.toLowerCase().includes('email not confirmed')) {
         throw new Error('Email Anda belum diverifikasi. Silakan buka kotak masuk/spam email Anda dan klik tautan verifikasi terlebih dahulu.');
       }
       throw new Error(error.message);
-    }
-
-    if (!data.user?.email_confirmed_at) {
-      await supabase.auth.signOut();
-      throw new Error('Email Anda belum diverifikasi. Silakan klik tautan verifikasi yang dikirim ke email Anda.');
     }
 
     const me = await requestApi('/auth/me');

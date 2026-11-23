@@ -1,7 +1,10 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { MapContainer, TileLayer, Circle, CircleMarker, Tooltip, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import { publicApi } from '../api';
+import { supabase } from '../supabaseClient';
+
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 const LEVEL_COLORS = {
   parah: '#dc2626',   // Merah
@@ -9,7 +12,6 @@ const LEVEL_COLORS = {
   ringan: '#16a34a'   // Hijau
 };
 
-// Hitung jarak 2 titik koordinat dalam meter (Rumus Haversine)
 function getDistanceMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const toRad = (deg) => (deg * Math.PI) / 180;
@@ -27,33 +29,63 @@ function formatDistance(meters) {
   return `${(meters / 1000).toFixed(2)} km`;
 }
 
-// Komponen pembantu agar peta menggeser kamera ke titik data sampah atau pilihan pencarian
 function MapRecenter({ center }) {
   const map = useMap();
+  const lastCenteredRef = useRef('');
+
   useEffect(() => {
     if (center && center.length === 2) {
-      map.setView(center, map.getZoom(), { animate: true });
+      const key = `${center[0].toFixed(5)},${center[1].toFixed(5)}`;
+      if (lastCenteredRef.current !== key) {
+        lastCenteredRef.current = key;
+        map.setView(center, 17, { animate: true });
+      }
     }
   }, [center, map]);
+
   return null;
 }
 
-export default function MapPage({ goReport }) {
+export default function MapPage({
+  currentUser,
+  focusedZone,
+  onClearFocusedZone,
+  goReport,
+  goVolunteerAuth,
+  onTaskClaimed
+}) {
   const [hotspots, setHotspots] = useState([]);
   const [stats, setStats] = useState(null);
   const [filterLevel, setFilterLevel] = useState('');
   const [loading, setLoading] = useState(true);
-  const [selectedZone, setSelectedZone] = useState(null);
+  const [selectedZone, setSelectedZone] = useState(focusedZone || null);
 
   // State lokasi user real-time & pencarian lokasi terdekat
   const [userPos, setUserPos] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
-  const [manualCenter, setManualCenter] = useState(null);
+  const [manualCenter, setManualCenter] = useState(
+    focusedZone ? [focusedZone.latitude, focusedZone.longitude] : null
+  );
+
+  // State pengambilan tugas oleh relawan
+  const [myGroups, setMyGroups] = useState([]);
+  const [selectedGroupId, setSelectedGroupId] = useState('');
+  const [claiming, setClaiming] = useState(false);
+  const [claimMsg, setClaimMsg] = useState('');
 
   const defaultCenter = [-7.3305, 110.5084];
 
-  // Pantau lokasi user secara real-time (tanpa menghilangkan fokus dari data sampah)
+  // Sinkronkan jika ada titik tugas yang dikirim dari Dashboard Relawan
+  useEffect(() => {
+    if (focusedZone) {
+      setSelectedZone(focusedZone);
+      setManualCenter([focusedZone.latitude, focusedZone.longitude]);
+      setClaimMsg('');
+    }
+  }, [focusedZone]);
+
+  // Pantau lokasi user secara real-time
   useEffect(() => {
     if (!navigator.geolocation) return;
     const watchId = navigator.geolocation.watchPosition(
@@ -69,6 +101,26 @@ export default function MapPage({ goReport }) {
     );
     return () => navigator.geolocation.clearWatch(watchId);
   }, []);
+
+  // Muat daftar grup relawan jika user sedang login sebagai volunteer
+  useEffect(() => {
+    if (currentUser?.role !== 'volunteer') return;
+    (async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session?.access_token) return;
+        const res = await fetch(`${API_BASE}/volunteer/dashboard`, {
+          headers: { Authorization: `Bearer ${session.access_token}` }
+        });
+        const data = await res.json();
+        if (res.ok && data.my_groups) {
+          setMyGroups(data.my_groups);
+        }
+      } catch {
+        // Abaikan jika gagal memuat grup
+      }
+    })();
+  }, [currentUser]);
 
   const loadMapData = async () => {
     try {
@@ -104,6 +156,15 @@ export default function MapPage({ goReport }) {
     return list;
   }, [hotspots, userPos]);
 
+  // Perbarui jarak pada selectedZone secara real-time saat GPS bergerak
+  const activeZone = useMemo(() => {
+    if (!selectedZone) return null;
+    const distanceMeters = userPos
+      ? getDistanceMeters(userPos.lat, userPos.lng, selectedZone.latitude, selectedZone.longitude)
+      : selectedZone.distanceMeters ?? null;
+    return { ...selectedZone, distanceMeters };
+  }, [selectedZone, userPos]);
+
   // Hasil pencarian yang otomatis direkomendasikan dari yang paling dekat dengan user
   const recommendedZones = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -117,14 +178,56 @@ export default function MapPage({ goReport }) {
     return filtered.slice(0, 6);
   }, [sortedHotspots, searchQuery]);
 
-  // Tetap prioritaskan koordinat data sampah (hotspots[0]) seperti kode asli Anda
+  // Prioritaskan pilihan manual (dari dashboard/pencarian) -> lokasi GPS user -> titik terdekat -> default
   const mapCenter = manualCenter
     ? manualCenter
-    : hotspots.length > 0
-      ? [hotspots[0].latitude, hotspots[0].longitude]
-      : userPos
-        ? [userPos.lat, userPos.lng]
+    : userPos
+      ? [userPos.lat, userPos.lng]
+      : sortedHotspots.length > 0
+        ? [sortedHotspots[0].latitude, sortedHotspots[0].longitude]
         : defaultCenter;
+
+  // Fungsi ambil tugas langsung dari panel peta
+  const handleClaimTaskFromMap = async (zone) => {
+    try {
+      setClaiming(true);
+      setClaimMsg('');
+      const { data: { session } } = await supabase.auth.getSession();
+      const res = await fetch(`${API_BASE}/volunteer/hotspots/${zone.id}/claim`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {})
+        },
+        body: JSON.stringify({ group_id: selectedGroupId || null })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Gagal mengambil tugas.');
+
+      setClaimMsg('Tugas pembersihan berhasil diambil! Membuka Riwayat Tugas...');
+      await loadMapData();
+      if (typeof onTaskClaimed === 'function') {
+        setTimeout(() => onTaskClaimed(), 900);
+      }
+    } catch (err) {
+      setClaimMsg(err.message);
+    } finally {
+      setClaiming(false);
+    }
+  };
+
+  // URL Google Maps Rute dari lokasi GPS pengguna ke titik sampah
+  const buildDirectionsUrl = (zone) => {
+    const dest = `${zone.latitude},${zone.longitude}`;
+    if (userPos) {
+      const origin = `${userPos.lat},${userPos.lng}`;
+      return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${dest}&travelmode=walking`;
+    }
+    return `https://www.google.com/maps/dir/?api=1&destination=${dest}`;
+  };
+
+  const isVolunteer = currentUser?.role === 'volunteer' || ['admin', 'super_admin'].includes(currentUser?.role);
+  const isVerifiedVolunteer = currentUser?.volunteer_status === 'verified' || ['admin', 'super_admin'].includes(currentUser?.role);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 105px)', position: 'relative' }}>
@@ -192,6 +295,7 @@ export default function MapPage({ goReport }) {
                       onMouseDown={() => {
                         setManualCenter([zone.latitude, zone.longitude]);
                         setSelectedZone(zone);
+                        setClaimMsg('');
                         setSearchOpen(false);
                       }}
                       style={{
@@ -227,10 +331,7 @@ export default function MapPage({ goReport }) {
 
           <select
             value={filterLevel}
-            onChange={(e) => {
-              setManualCenter(null);
-              setFilterLevel(e.target.value);
-            }}
+            onChange={(e) => setFilterLevel(e.target.value)}
             style={{ padding: '5px 8px', borderRadius: '6px', border: '1px solid #94a3b8', fontSize: '0.85rem', background: '#fff' }}
           >
             <option value="">Semua Tingkat Prioritas</option>
@@ -240,10 +341,7 @@ export default function MapPage({ goReport }) {
           </select>
 
           <button
-            onClick={() => {
-              setManualCenter(null);
-              loadMapData();
-            }}
+            onClick={loadMapData}
             style={{
               padding: '5px 10px',
               borderRadius: '6px',
@@ -330,20 +428,24 @@ export default function MapPage({ goReport }) {
           {sortedHotspots.map((zone) => {
             const color = zone.status === 'resolved' ? '#64748b' : (LEVEL_COLORS[zone.priority_level] || '#f59e0b');
             const photoCount = zone.photos?.length || zone.total_hotspots || 1;
+            const isSelected = activeZone?.id === zone.id;
 
             return (
               <Circle
                 key={zone.id}
                 center={[zone.latitude, zone.longitude]}
-                radius={25}
+                radius={isSelected ? 32 : 25}
                 pathOptions={{
-                  color,
-                  weight: 2.5,
+                  color: isSelected ? '#0f172a' : color,
+                  weight: isSelected ? 3.5 : 2.5,
                   fillColor: color,
-                  fillOpacity: zone.status === 'resolved' ? 0.25 : 0.45
+                  fillOpacity: zone.status === 'resolved' ? 0.25 : 0.5
                 }}
                 eventHandlers={{
-                  click: () => setSelectedZone(zone)
+                  click: () => {
+                    setSelectedZone(zone);
+                    setClaimMsg('');
+                  }
                 }}
               >
                 <Tooltip direction="top" offset={[0, -5]} opacity={0.95}>
@@ -371,7 +473,7 @@ export default function MapPage({ goReport }) {
         >
           {userPos && (
             <button
-              onClick={() => setManualCenter([userPos.lat, userPos.lng])}
+              onClick={() => setManualCenter([userPos.lat + Math.random() * 0.000001, userPos.lng])}
               style={{
                 padding: '6px 10px',
                 borderRadius: '8px',
@@ -416,8 +518,8 @@ export default function MapPage({ goReport }) {
           </div>
         </div>
 
-        {/* Panel Detail & Galeri Foto Saat Lingkaran Lokasi Ditekan */}
-        {selectedZone && (
+        {/* Panel Detail, Petunjuk Lokasi, Ambil Tugas / Ajakan Relawan & Galeri Foto */}
+        {activeZone && (
           <div
             style={{
               position: 'absolute',
@@ -425,67 +527,180 @@ export default function MapPage({ goReport }) {
               left: '50%',
               transform: 'translateX(-50%)',
               width: '92%',
-              maxWidth: '520px',
-              maxHeight: '65vh',
+              maxWidth: '540px',
+              maxHeight: '72vh',
               overflowY: 'auto',
               background: '#fff',
-              borderRadius: '12px',
-              boxShadow: '0 10px 25px rgba(0,0,0,0.25)',
+              borderRadius: '14px',
+              boxShadow: '0 12px 30px rgba(0,0,0,0.28)',
               padding: '16px',
               zIndex: 1001,
               border: '1px solid #cbd5e1'
             }}
           >
+            {/* Header Titik */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px' }}>
               <div>
-                <h3 style={{ margin: 0, fontSize: '1.05rem', color: '#0f172a' }}>{selectedZone.title}</h3>
+                <h3 style={{ margin: 0, fontSize: '1.08rem', color: '#0f172a' }}>{activeZone.title}</h3>
                 <p style={{ margin: '4px 0 0 0', fontSize: '0.8rem', color: '#64748b' }}>
-                  Koordinat: {selectedZone.latitude.toFixed(5)}, {selectedZone.longitude.toFixed(5)}
-                  {selectedZone.distanceMeters != null && (
-                    <span style={{ color: '#0f766e', fontWeight: '700' }}> · Jarak {formatDistance(selectedZone.distanceMeters)} dari Anda</span>
+                  Koordinat: {activeZone.latitude.toFixed(5)}, {activeZone.longitude.toFixed(5)}
+                  {activeZone.distanceMeters != null && (
+                    <span style={{ color: '#0f766e', fontWeight: '700' }}> · Jarak {formatDistance(activeZone.distanceMeters)} dari Anda</span>
                   )}
                 </p>
               </div>
               <button
-                onClick={() => setSelectedZone(null)}
-                style={{ background: '#e2e8f0', border: 'none', borderRadius: '6px', padding: '4px 10px', cursor: 'pointer', fontWeight: 'bold' }}
+                onClick={() => {
+                  setSelectedZone(null);
+                  setClaimMsg('');
+                  if (typeof onClearFocusedZone === 'function') onClearFocusedZone();
+                }}
+                style={{ background: '#e2e8f0', border: 'none', borderRadius: '6px', padding: '5px 10px', cursor: 'pointer', fontWeight: 'bold' }}
               >
                 ✕ Tutup
               </button>
             </div>
 
+            {/* Badge Status */}
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', margin: '10px 0', fontSize: '0.8rem' }}>
               <span style={{ padding: '3px 8px', borderRadius: '4px', background: '#fef3c7', color: '#b45309', fontWeight: 'bold' }}>
-                Prioritas: {selectedZone.priority_level?.toUpperCase()} (Skor {selectedZone.priority_score})
+                Prioritas: {activeZone.priority_level?.toUpperCase()} (Skor {activeZone.priority_score})
               </span>
               <span style={{ padding: '3px 8px', borderRadius: '4px', background: '#e0f2fe', color: '#0369a1' }}>
-                Kategori: {selectedZone.primary_category}
+                Kategori: {activeZone.primary_category}
               </span>
               <span style={{ padding: '3px 8px', borderRadius: '4px', background: '#f1f5f9', color: '#334155' }}>
-                Total Bukti Foto: {selectedZone.photos?.length || 0}
+                Bukti Foto: {activeZone.photos?.length || 0}
               </span>
             </div>
 
-            <h4 style={{ margin: '12px 0 8px 0', fontSize: '0.9rem', borderTop: '1px solid #e2e8f0', paddingTop: '10px' }}>
+            {/* Petunjuk Arah & Aksi Pembersihan */}
+            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '10px', padding: '12px', margin: '10px 0', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              <a
+                href={buildDirectionsUrl(activeZone)}
+                target="_blank"
+                rel="noreferrer"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '6px',
+                  width: '100%',
+                  padding: '9px',
+                  borderRadius: '8px',
+                  border: '1px solid #2563eb',
+                  background: '#eff6ff',
+                  color: '#1d4ed8',
+                  fontWeight: '700',
+                  fontSize: '0.86rem',
+                  textDecoration: 'none',
+                  boxSizing: 'border-box'
+                }}
+              >
+                🧭 Petunjuk Lokasi & Rute Google Maps ↗
+              </a>
+
+              {claimMsg && (
+                <div style={{ padding: '8px 10px', borderRadius: '6px', fontSize: '0.82rem', fontWeight: '600', background: claimMsg.includes('berhasil') ? '#dcfce7' : '#fee2e2', color: claimMsg.includes('berhasil') ? '#166534' : '#b91c1c' }}>
+                  {claimMsg}
+                </div>
+              )}
+
+              {activeZone.status === 'resolved' ? (
+                <div style={{ textAlign: 'center', fontSize: '0.84rem', fontWeight: '700', color: '#16a34a', padding: '4px' }}>
+                  ✓ Titik sampah ini sudah selesai dibersihkan.
+                </div>
+              ) : isVolunteer ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {myGroups.length > 0 && (
+                    <select
+                      value={selectedGroupId}
+                      onChange={(e) => setSelectedGroupId(e.target.value)}
+                      style={{ width: '100%', padding: '7px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '0.84rem', background: '#fff' }}
+                    >
+                      <option value="">Kerjakan Sebagai Individu</option>
+                      {myGroups.map((g) => (
+                        <option key={g.id} value={g.id}>Kerjakan Bersama Grup: {g.name}</option>
+                      ))}
+                    </select>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={!isVerifiedVolunteer || claiming}
+                    onClick={() => handleClaimTaskFromMap(activeZone)}
+                    style={{
+                      width: '100%',
+                      padding: '10px',
+                      borderRadius: '8px',
+                      border: 'none',
+                      background: isVerifiedVolunteer ? '#0f766e' : '#cbd5e1',
+                      color: isVerifiedVolunteer ? '#fff' : '#475569',
+                      fontWeight: '700',
+                      fontSize: '0.9rem',
+                      cursor: isVerifiedVolunteer && !claiming ? 'pointer' : 'not-allowed'
+                    }}
+                  >
+                    {!isVerifiedVolunteer
+                      ? '⏳ Akun Anda Menunggu Verifikasi Admin'
+                      : claiming
+                        ? 'Mengambil Tugas...'
+                        : '🧹 Ambil Tugas Pembersihan Ini'}
+                  </button>
+                </div>
+              ) : (
+                <div style={{ background: '#f0fdfa', border: '1px solid #99f6e4', borderRadius: '8px', padding: '10px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                  <div>
+                    <div style={{ fontWeight: '700', fontSize: '0.88rem', color: '#0f766e' }}>
+                      Ingin menjadi relawan?
+                    </div>
+                    <div style={{ fontSize: '0.78rem', color: '#334155' }}>
+                      Daftar atau masuk untuk ikut membersihkan titik sampah ini.
+                    </div>
+                  </div>
+                  {typeof goVolunteerAuth === 'function' && (
+                    <button
+                      type="button"
+                      onClick={goVolunteerAuth}
+                      style={{
+                        padding: '7px 12px',
+                        borderRadius: '8px',
+                        border: 'none',
+                        background: '#0f766e',
+                        color: '#fff',
+                        fontWeight: '700',
+                        fontSize: '0.82rem',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Gabung Relawan →
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Galeri Foto */}
+            <h4 style={{ margin: '10px 0 8px 0', fontSize: '0.88rem', borderTop: '1px solid #e2e8f0', paddingTop: '10px' }}>
               Galeri Foto Laporan di Area Ini
             </h4>
 
-            {(!selectedZone.photos || selectedZone.photos.length === 0) ? (
+            {(!activeZone.photos || activeZone.photos.length === 0) ? (
               <p style={{ fontSize: '0.85rem', color: '#64748b' }}>Belum ada lampiran foto tersimpan untuk zona ini.</p>
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '10px' }}>
-                {selectedZone.photos.map((photo, idx) => (
+                {activeZone.photos.map((photo, idx) => (
                   <div key={photo.id || idx} style={{ border: '1px solid #e2e8f0', borderRadius: '8px', overflow: 'hidden', background: '#f8fafc' }}>
                     {photo.photo_url ? (
                       <a href={photo.photo_url} target="_blank" rel="noreferrer">
                         <img
                           src={photo.photo_url}
                           alt={`Bukti ${idx + 1}`}
-                          style={{ width: '100%', height: '110px', objectFit: 'cover', display: 'block' }}
+                          style={{ width: '100%', height: '105px', objectFit: 'cover', display: 'block' }}
                         />
                       </a>
                     ) : (
-                      <div style={{ height: '110px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.75rem', color: '#94a3b8' }}>
+                      <div style={{ height: '105px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.75rem', color: '#94a3b8' }}>
                         Foto tidak tersedia
                       </div>
                     )}

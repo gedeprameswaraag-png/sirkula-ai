@@ -41,9 +41,18 @@ router.get('/reports/my', requireAuth, safeHandler(reportController.getMyReports
 router.get('/volunteer/dashboard', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.getDashboardData, 'getDashboardData'));
 router.post('/volunteer/hotspots/:hotspotId/claim', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.claimHotspotTask, 'claimHotspotTask'));
 router.post('/volunteer/tasks/:taskId/complete', requireAuth, requireRole('volunteer', 'admin'), upload.single('image'), safeHandler(volunteerController.completeTask, 'completeTask'));
+
+// Komunitas, Grup, Daftar Anggota, Chat Grup, Undangan & Pesan Langsung (DM)
 router.get('/volunteer/community', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.getCommunityData, 'getCommunityData'));
 router.post('/volunteer/groups', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.createCollaborationGroup, 'createCollaborationGroup'));
 router.post('/volunteer/groups/:groupId/join', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.joinCollaborationGroup, 'joinCollaborationGroup'));
+router.get('/volunteer/groups/:groupId/details', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.getGroupDetails, 'getGroupDetails'));
+router.post('/volunteer/groups/:groupId/messages', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.sendGroupMessage, 'sendGroupMessage'));
+router.post('/volunteer/groups/:groupId/invite', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.inviteToGroup, 'inviteToGroup'));
+router.post('/volunteer/invitations/:invitationId/respond', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.respondGroupInvitation, 'respondGroupInvitation'));
+
+router.get('/volunteer/dm/:peerId', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.getDirectMessages, 'getDirectMessages'));
+router.post('/volunteer/dm/:peerId', requireAuth, requireRole('volunteer', 'admin'), safeHandler(volunteerController.sendDirectMessage, 'sendDirectMessage'));
 
 // ================= ADMIN ROUTES =================
 router.get('/admin/reports', requireAuth, requireRole('admin', 'super_admin'), safeHandler(adminController.getAllReports, 'getAllReports'));

@@ -1,8 +1,25 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { supabase } from '../supabaseClient';
-import MapPage from './MapPage.jsx';
+import CommunityHub from './CommunityHub.jsx';
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
+
+function getDistanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function formatDistance(meters) {
+  if (meters == null) return '';
+  if (meters < 1000) return `${Math.round(meters)} m`;
+  return `${(meters / 1000).toFixed(2)} km`;
+}
 
 async function volFetch(endpoint, options = {}) {
   const { data: { session } } = await supabase.auth.getSession();
@@ -19,18 +36,15 @@ async function volFetch(endpoint, options = {}) {
   return data;
 }
 
-export default function VolunteerDashboard({ currentUser, onLogout }) {
-  const [tab, setTab] = useState('peta'); // peta | riwayat | komunitas | profil
+export default function VolunteerDashboard({ currentUser, onLogout, onSelectHotspotOnMap }) {
+  const [tab, setTab] = useState('tugas'); // tugas | riwayat | komunitas | profil
   const [profile, setProfile] = useState(currentUser);
-  const [myGroups, setMyGroups] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [hotspots, setHotspots] = useState([]);
-  const [community, setCommunity] = useState({ volunteers: [], groups: [] });
-  const [selectedGroupId, setSelectedGroupId] = useState('');
-  const [searchVol, setSearchVol] = useState('');
-  const [groupName, setGroupName] = useState('');
-  const [groupDesc, setGroupDesc] = useState('');
   const [msg, setMsg] = useState('');
+  const [userPos, setUserPos] = useState(null);
+  const [hoveredCardId, setHoveredCardId] = useState(null);
+  const [pressedCardId, setPressedCardId] = useState(null);
 
   // State form penyelesaian tugas
   const [completingTaskId, setCompletingTaskId] = useState(null);
@@ -39,18 +53,31 @@ export default function VolunteerDashboard({ currentUser, onLogout }) {
   const [proofFile, setProofFile] = useState(null);
   const [submittingProof, setSubmittingProof] = useState(false);
 
+  // Pantau GPS relawan untuk mengurutkan titik terdekat
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        setUserPos({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude
+        });
+      },
+      () => {},
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, []);
+
   const loadAll = async () => {
     try {
-      const [dashRes, hsRes, commRes] = await Promise.all([
+      const [dashRes, hsRes] = await Promise.all([
         volFetch('/volunteer/dashboard'),
-        volFetch('/public/hotspots'),
-        volFetch('/volunteer/community')
+        volFetch('/public/hotspots')
       ]);
       if (dashRes.profile) setProfile(dashRes.profile);
-      setMyGroups(dashRes.my_groups || []);
       setTasks(dashRes.tasks || []);
-      setHotspots((hsRes.hotspots || []).filter((h) => h.status === 'open'));
-      setCommunity({ volunteers: commRes.volunteers || [], groups: commRes.groups || [] });
+      setHotspots((hsRes.hotspots || []).filter((h) => h.status !== 'resolved'));
     } catch (err) {
       setMsg(err.message);
     }
@@ -60,17 +87,27 @@ export default function VolunteerDashboard({ currentUser, onLogout }) {
     loadAll();
   }, []);
 
-  const handleClaim = async (hotspotId) => {
-    try {
-      await volFetch(`/volunteer/hotspots/${hotspotId}/claim`, {
-        method: 'POST',
-        body: JSON.stringify({ group_id: selectedGroupId || null })
-      });
-      setMsg('Tugas pembersihan berhasil diambil! Silakan buka tab Riwayat Penyelesaian.');
-      loadAll();
-    } catch (err) {
-      setMsg(err.message);
+  // Urutkan titik sampah dari yang terdekat dengan lokasi GPS relawan
+  const sortedHotspots = useMemo(() => {
+    const mapped = hotspots.map((hs) => ({
+      ...hs,
+      distanceMeters: userPos
+        ? getDistanceMeters(userPos.lat, userPos.lng, hs.latitude, hs.longitude)
+        : null
+    }));
+    if (userPos) {
+      mapped.sort((a, b) => a.distanceMeters - b.distanceMeters);
     }
+    return mapped;
+  }, [hotspots, userPos]);
+
+  const handleOpenTaskOnMap = (hs) => {
+    setPressedCardId(hs.id);
+    setTimeout(() => {
+      if (typeof onSelectHotspotOnMap === 'function') {
+        onSelectHotspotOnMap(hs);
+      }
+    }, 150);
   };
 
   const handleCompleteSubmit = async (e) => {
@@ -104,41 +141,42 @@ export default function VolunteerDashboard({ currentUser, onLogout }) {
     }
   };
 
-  const handleCreateGroup = async (e) => {
-    e.preventDefault();
-    try {
-      await volFetch('/volunteer/groups', {
-        method: 'POST',
-        body: JSON.stringify({ name: groupName, description: groupDesc })
-      });
-      setGroupName('');
-      setGroupDesc('');
-      setMsg('Grup kolaborasi berhasil dibuat.');
-      loadAll();
-    } catch (err) {
-      setMsg(err.message);
-    }
-  };
-
-  const handleJoinGroup = async (groupId) => {
-    try {
-      await volFetch(`/volunteer/groups/${groupId}/join`, { method: 'POST' });
-      setMsg('Berhasil bergabung ke grup kolaborasi.');
-      loadAll();
-    } catch (err) {
-      setMsg(err.message);
-    }
-  };
-
   const isVerified = profile?.volunteer_status === 'verified';
 
   return (
     <div style={{ maxWidth: '1040px', margin: '0 auto', padding: '16px' }}>
+      <style>{`
+        @keyframes sirkulaFadeUp {
+          from {
+            opacity: 0;
+            transform: translateY(12px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        .sirkula-task-card {
+          animation: sirkulaFadeUp 0.35s ease-out both;
+          transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+                      box-shadow 0.22s ease,
+                      border-color 0.22s ease,
+                      background-color 0.22s ease;
+        }
+        .sirkula-task-btn {
+          transition: background-color 0.2s ease, transform 0.15s ease;
+        }
+        .sirkula-task-card:hover .sirkula-task-btn {
+          background-color: #115e59 !important;
+        }
+      `}</style>
+
+      {/* Header Dashboard */}
       <div style={{ background: '#0f766e', color: '#fff', borderRadius: '12px', padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '16px' }}>
         <div>
           <div style={{ fontSize: '0.8rem', opacity: 0.85 }}>Dashboard Sukarelawan</div>
           <h2 style={{ margin: '2px 0' }}>{profile?.full_name}</h2>
-          <div style={{ display: 'flex', gap: '8px', marginTop: '4px', fontSize: '0.82rem' }}>
+          <div style={{ display: 'flex', gap: '8px', marginTop: '4px', fontSize: '0.82rem', flexWrap: 'wrap' }}>
             <span style={{ background: 'rgba(255,255,255,0.2)', padding: '2px 10px', borderRadius: '99px', fontWeight: '700' }}>
               Level: {profile?.volunteer_level || 'Pemula'} ({profile?.experience_points || 0} XP)
             </span>
@@ -153,16 +191,18 @@ export default function VolunteerDashboard({ currentUser, onLogout }) {
       </div>
 
       {msg && (
-        <div style={{ padding: '10px 14px', background: '#f0fdfa', border: '1px solid #99f6e4', color: '#0f766e', borderRadius: '8px', marginBottom: '14px', fontSize: '0.88rem', fontWeight: '600' }}>
-          {msg}
+        <div style={{ padding: '10px 14px', background: '#f0fdfa', border: '1px solid #99f6e4', color: '#0f766e', borderRadius: '8px', marginBottom: '14px', fontSize: '0.88rem', fontWeight: '600', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>{msg}</span>
+          <button onClick={() => setMsg('')} style={{ background: 'none', border: 'none', color: '#0f766e', cursor: 'pointer', fontWeight: '700' }}>✕</button>
         </div>
       )}
 
+      {/* Tab Navigasi */}
       <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px' }}>
         {[
-          { id: 'peta', label: '🗺️ Peta & Ambil Tugas' },
+          { id: 'tugas', label: `🧹 Ambil Tugas (${sortedHotspots.length})` },
           { id: 'riwayat', label: `📋 Riwayat Penyelesaian (${tasks.length})` },
-          { id: 'komunitas', label: '🤝 Komunitas & Grup' },
+          { id: 'komunitas', label: '💬 Komunitas & Grup' },
           { id: 'profil', label: '👤 Profil & Level' }
         ].map((t) => (
           <button
@@ -170,6 +210,7 @@ export default function VolunteerDashboard({ currentUser, onLogout }) {
             onClick={() => setTab(t.id)}
             style={{
               padding: '9px 15px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontWeight: '700', fontSize: '0.88rem',
+              transition: 'all 0.2s ease',
               background: tab === t.id ? '#0f766e' : '#e2e8f0',
               color: tab === t.id ? '#fff' : '#334155'
             }}
@@ -179,39 +220,98 @@ export default function VolunteerDashboard({ currentUser, onLogout }) {
         ))}
       </div>
 
-      {tab === 'peta' && (
-        <div style={{ display: 'grid', gap: '18px' }}>
-          <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px', marginBottom: '12px' }}>
-              <h3 style={{ margin: 0 }}>Titik Sampah Siap Dibersihkan ({hotspots.length})</h3>
-              <select value={selectedGroupId} onChange={(e) => setSelectedGroupId(e.target.value)} style={{ padding: '6px 10px', borderRadius: '8px', border: '1px solid #cbd5e1' }}>
-                <option value="">Kerjakan Sebagai Individu</option>
-                {myGroups.map((g) => (
-                  <option key={g.id} value={g.id}>Grup: {g.name}</option>
-                ))}
-              </select>
-            </div>
-            {hotspots.length === 0 ? (
-              <p style={{ color: '#64748b', fontSize: '0.9rem' }}>Belum ada titik lokasi terbuka yang menunggu pembersihan.</p>
-            ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '12px' }}>
-                {hotspots.map((hs) => (
-                  <div key={hs.id} style={{ border: '1px solid #e2e8f0', borderRadius: '10px', padding: '12px', background: '#f8fafc' }}>
-                    <div style={{ fontWeight: '700' }}>{hs.title}</div>
-                    <div style={{ fontSize: '0.8rem', color: '#64748b', margin: '4px 0 10px 0' }}>Prioritas: {hs.priority_level?.toUpperCase()}</div>
+      {tab === 'tugas' && (
+        <div style={{ background: '#fff', padding: '18px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+          <div style={{ marginBottom: '14px' }}>
+            <h3 style={{ margin: 0 }}>Titik Sampah Siap Dibersihkan ({sortedHotspots.length})</h3>
+            <p style={{ margin: '2px 0 0 0', fontSize: '0.82rem', color: '#64748b' }}>
+              {userPos
+                ? 'Diurutkan otomatis dari jarak terdekat dengan posisi GPS Anda. Tekan kartu untuk melihat lokasi di peta.'
+                : 'Aktifkan GPS untuk melihat jarak terdekat dari posisi Anda.'}
+            </p>
+          </div>
+
+          {sortedHotspots.length === 0 ? (
+            <p style={{ color: '#64748b', fontSize: '0.9rem' }}>Belum ada titik lokasi terbuka yang menunggu pembersihan.</p>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(270px, 1fr))', gap: '12px' }}>
+              {sortedHotspots.map((hs, idx) => {
+                const isHovered = hoveredCardId === hs.id;
+                const isPressed = pressedCardId === hs.id;
+                const isNearest = idx === 0 && userPos;
+
+                return (
+                  <div
+                    key={hs.id}
+                    role="button"
+                    tabIndex={0}
+                    className="sirkula-task-card"
+                    onClick={() => handleOpenTaskOnMap(hs)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') handleOpenTaskOnMap(hs);
+                    }}
+                    onMouseEnter={() => setHoveredCardId(hs.id)}
+                    onMouseLeave={() => setHoveredCardId(null)}
+                    style={{
+                      animationDelay: `${idx * 60}ms`,
+                      border: isHovered ? '1.5px solid #0f766e' : '1px solid #e2e8f0',
+                      borderRadius: '10px',
+                      padding: '14px',
+                      background: isHovered ? '#f0fdfa' : isNearest ? '#f0fdfa' : '#f8fafc',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      justifyContent: 'space-between',
+                      gap: '12px',
+                      cursor: 'pointer',
+                      transform: isPressed
+                        ? 'scale(0.97)'
+                        : isHovered
+                          ? 'translateY(-4px)'
+                          : 'translateY(0)',
+                      boxShadow: isHovered
+                        ? '0 10px 20px rgba(15, 118, 110, 0.14)'
+                        : '0 1px 3px rgba(15, 23, 42, 0.04)'
+                    }}
+                  >
+                    <div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '6px' }}>
+                        <div style={{ fontWeight: '700', color: '#0f172a' }}>{hs.title}</div>
+                        {hs.distanceMeters != null && (
+                          <span style={{ fontSize: '0.75rem', fontWeight: '700', padding: '2px 8px', borderRadius: '99px', background: isNearest ? '#0f766e' : '#e2e8f0', color: isNearest ? '#fff' : '#334155', flexShrink: 0 }}>
+                            {formatDistance(hs.distanceMeters)}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: '0.8rem', color: '#64748b', marginTop: '4px' }}>
+                        Prioritas: <b>{hs.priority_level?.toUpperCase()}</b> · Bukti Foto: {hs.photos?.length || 1}
+                      </div>
+                    </div>
+
                     <button
-                      disabled={!isVerified}
-                      onClick={() => handleClaim(hs.id)}
-                      style={{ width: '100%', padding: '8px', borderRadius: '8px', border: 'none', background: isVerified ? '#0f766e' : '#cbd5e1', color: isVerified ? '#fff' : '#64748b', fontWeight: '700', cursor: isVerified ? 'pointer' : 'not-allowed' }}
+                      type="button"
+                      className="sirkula-task-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleOpenTaskOnMap(hs);
+                      }}
+                      style={{
+                        width: '100%',
+                        padding: '9px',
+                        borderRadius: '8px',
+                        border: 'none',
+                        background: '#0f766e',
+                        color: '#fff',
+                        fontWeight: '700',
+                        cursor: 'pointer'
+                      }}
                     >
-                      {isVerified ? 'Ambil Tugas Ini' : 'Menunggu Verifikasi Admin'}
+                      Ambil Tugas
                     </button>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
-          <MapPage />
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
@@ -279,38 +379,12 @@ export default function VolunteerDashboard({ currentUser, onLogout }) {
       )}
 
       {tab === 'komunitas' && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '16px' }}>
-          <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-            <h3 style={{ marginTop: 0 }}>Grup Kolaborasi</h3>
-            <form onSubmit={handleCreateGroup} style={{ display: 'grid', gap: '8px', marginBottom: '14px' }}>
-              <input type="text" required value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="Nama Grup Kolaborasi Baru" style={{ padding: '8px', borderRadius: '6px', border: '1px solid #cbd5e1' }} />
-              <input type="text" value={groupDesc} onChange={(e) => setGroupDesc(e.target.value)} placeholder="Deskripsi singkat grup" style={{ padding: '8px', borderRadius: '6px', border: '1px solid #cbd5e1' }} />
-              <button type="submit" style={{ padding: '8px', borderRadius: '6px', border: 'none', background: '#0f766e', color: '#fff', fontWeight: '600', cursor: 'pointer' }}>Buat Grup</button>
-            </form>
-            {community.groups.map((g) => (
-              <div key={g.id} style={{ padding: '10px', border: '1px solid #e2e8f0', borderRadius: '8px', marginBottom: '8px' }}>
-                <div style={{ fontWeight: '700' }}>{g.name}</div>
-                <p style={{ margin: '4px 0 8px 0', fontSize: '0.82rem', color: '#475569' }}>{g.description}</p>
-                <button onClick={() => handleJoinGroup(g.id)} style={{ padding: '5px 10px', borderRadius: '6px', border: '1px solid #0f766e', background: '#fff', color: '#0f766e', fontSize: '0.8rem', cursor: 'pointer' }}>
-                  Gabung Grup
-                </button>
-              </div>
-            ))}
-          </div>
-
-          <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-            <h3 style={{ marginTop: 0 }}>Cari Sukarelawan Lain</h3>
-            <input type="text" value={searchVol} onChange={(e) => setSearchVol(e.target.value)} placeholder="Cari nama relawan..." style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #cbd5e1', marginBottom: '10px' }} />
-            {community.volunteers
-              .filter((v) => v.full_name?.toLowerCase().includes(searchVol.toLowerCase()))
-              .map((v) => (
-                <div key={v.id} style={{ padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: '8px', marginBottom: '6px', display: 'flex', justifyContent: 'space-between' }}>
-                  <span><b>{v.full_name}</b> ({v.completed_tasks_count || 0} tugas)</span>
-                  <span style={{ color: '#0f766e', fontWeight: '700' }}>{v.volunteer_level || 'Pemula'}</span>
-                </div>
-              ))}
-          </div>
-        </div>
+        <CommunityHub
+          currentUser={profile}
+          hotspots={sortedHotspots}
+          onSelectHotspotOnMap={onSelectHotspotOnMap}
+          onToast={(text) => setMsg(text)}
+        />
       )}
 
       {tab === 'profil' && (
