@@ -1,15 +1,13 @@
-
 require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
 
 const env = require('./config/env');
-const app = express();
-
 const apiRoutes = require('./routes/apiRoutes');
 const aiRoutes = require('./routes/aiRoutes');
 
+const app = express();
 const PORT = env.PORT || 5000;
 
 // =====================================================
@@ -18,7 +16,7 @@ const PORT = env.PORT || 5000;
 
 app.disable('x-powered-by');
 
-// Aktifkan trust proxy jika aplikasi berjalan di hosting
+// Aktifkan trust proxy jika aplikasi berjalan di hosting (Vercel, dll.)
 if (env.TRUST_PROXY !== '0') {
   app.set('trust proxy', Number(env.TRUST_PROXY) || 1);
 }
@@ -29,23 +27,39 @@ if (env.TRUST_PROXY !== '0') {
 
 const allowedOrigins = env.CORS_ORIGINS;
 
-const corsOptions = {
-  origin: (origin, callback) => {
-    // Izinkan request tanpa Origin, misalnya health check server.
-    if (!origin) return callback(null, true);
+// Browser mengirim header Origin pada setiap POST, termasuk saat frontend
+// dan backend berada di domain yang sama. Origin yang sama dengan Host
+// server otomatis diizinkan, sisanya harus ada di CORS_ORIGIN.
+const corsOptionsDelegate = (req, callback) => {
+  const origin = req.header('Origin');
+  const host = req.header('X-Forwarded-Host') || req.header('Host');
 
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
+  let sameOrigin = false;
+
+  if (origin && host) {
+    try {
+      sameOrigin = new URL(origin).host === host;
+    } catch {
+      sameOrigin = false;
     }
+  }
 
-    return callback(new Error('Origin tidak diizinkan oleh CORS.'));
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
+  if (!origin || sameOrigin || allowedOrigins.includes(origin)) {
+    return callback(null, {
+      origin: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+      credentials: true
+    });
+  }
+
+  const error = new Error(`Origin tidak diizinkan oleh CORS: ${origin}`);
+  error.status = 403;
+
+  return callback(error);
 };
 
-app.use(cors(corsOptions));
+app.use(cors(corsOptionsDelegate));
 
 // =====================================================
 // BODY PARSER
@@ -102,33 +116,66 @@ app.use((req, res) => {
 // =====================================================
 
 app.use((err, req, res, next) => {
-  console.error('[API Error]:', err.message);
+  // Penyebab asli selalu tercatat di Logs (Vercel -> Logs).
+  console.error('[API Error]', {
+    method: req.method,
+    path: req.originalUrl,
+    name: err.name,
+    status: err.statusCode || err.status,
+    message: err.message,
+    stack: err.stack
+  });
 
   if (res.headersSent) {
     return next(err);
   }
 
   let status = err.statusCode || err.status || 500;
+  let message = err.message;
 
   if (err.code === 'LIMIT_FILE_SIZE') {
     status = 413;
+    message = 'Ukuran gambar terlalu besar.';
   }
 
-  res.status(status).json({
+  if (err.type === 'entity.parse.failed') {
+    status = 400;
+    message = 'Format JSON tidak valid.';
+  }
+
+  if (!Number.isInteger(status) || status < 400 || status > 599) {
+    status = 500;
+  }
+
+  // Error 4xx dan ApiError (mis. gagal upload ke storage) aman ditampilkan.
+  // Error tak terduga disamarkan, kecuali DEBUG_ERRORS=true.
+  const exposeMessage = status < 500 || err.name === 'ApiError';
+
+  const body = {
     success: false,
-    message:
-      status >= 500
-        ? 'Terjadi kesalahan pada server.'
-        : err.message || 'Permintaan tidak valid.'
-  });
+    message: exposeMessage
+      ? message || 'Permintaan tidak valid.'
+      : 'Terjadi kesalahan pada server.'
+  };
+
+  if (!exposeMessage && process.env.DEBUG_ERRORS === 'true') {
+    body.debug = err.message;
+  }
+
+  return res.status(status).json(body);
 });
 
 // =====================================================
 // START SERVER
 // =====================================================
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`SirkulaAI Backend berjalan pada port ${PORT}`);
-  console.log(`Environment: ${env.NODE_ENV}`);
-  console.log(`AI test endpoint: ${env.IS_PROD ? 'disabled' : 'enabled'}`);
-});
+// Vercel menjalankan app sebagai fungsi serverless, tanpa app.listen.
+if (!process.env.VERCEL) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`SirkulaAI Backend berjalan pada port ${PORT}`);
+    console.log(`Environment: ${env.NODE_ENV}`);
+    console.log(`AI test endpoint: ${env.IS_PROD ? 'disabled' : 'enabled'}`);
+  });
+}
+
+module.exports = app;
