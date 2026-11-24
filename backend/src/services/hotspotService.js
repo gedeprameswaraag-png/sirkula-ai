@@ -1,5 +1,6 @@
 const { supabaseAdmin } = require('../config/supabase');
-const { getSignedImageUrl } = require('./storageService');
+const env = require('../config/env');
+const { getSignedImageUrls } = require('./storageService');
 
 const CLUSTER_RADIUS_METERS = 35; // Jarak penggabungan titik dalam satu zona area (meter)
 
@@ -44,39 +45,36 @@ exports.getPublicHotspots = async ({ priorityLevel, category } = {}) => {
   // Ambil seluruh laporan terverifikasi beserta lampiran fotonya
   const { data: reports } = await supabaseAdmin
     .from('reports')
-    .select('id, hotspot_id, description, severity_level, created_at, report_images(storage_path)')
+    .select('id, hotspot_id, description, severity_level, created_at, photo_path')
     .eq('status', 'verified')
     .order('created_at', { ascending: false });
 
-  // Lampirkan foto pada tiap hotspot individual terlebih dahulu
-  const rawZones = await Promise.all(
-    (hotspots || []).map(async (hs) => {
-      const relatedReports = (reports || []).filter((r) => r.hotspot_id === hs.id);
-      const photos = [];
-
-      for (const rep of relatedReports) {
-        for (const img of rep.report_images || []) {
-          const signedUrl = await getSignedImageUrl('report-photos', img.storage_path).catch(() => null);
-          photos.push({
-            id: rep.id,
-            photo_url: signedUrl,
-            severity: rep.severity_level || hs.priority_level,
-            description: rep.description,
-            created_at: rep.created_at
-          });
-        }
-      }
-
-      return {
-        ...hs,
-        latitude: Number(hs.latitude),
-        longitude: Number(hs.longitude),
-        photos,
-        total_hotspots: 1,
-        member_ids: [hs.id]
-      };
-    })
+  // Tandatangani seluruh foto laporan sekaligus, lalu lampirkan ke tiap hotspot
+  const urlMap = await getSignedImageUrls(
+    env.BUCKET_REPORTS,
+    (reports || []).map((r) => r.photo_path)
   );
+
+  const rawZones = (hotspots || []).map((hs) => {
+    const photos = (reports || [])
+      .filter((r) => r.hotspot_id === hs.id && urlMap.get(r.photo_path))
+      .map((rep) => ({
+        id: rep.id,
+        photo_url: urlMap.get(rep.photo_path),
+        severity: rep.severity_level || hs.priority_level,
+        description: rep.description,
+        created_at: rep.created_at
+      }));
+
+    return {
+      ...hs,
+      latitude: Number(hs.latitude),
+      longitude: Number(hs.longitude),
+      photos,
+      total_hotspots: 1,
+      member_ids: [hs.id]
+    };
+  });
 
   // Gabungkan titik-titik yang jaraknya <= 35 meter menjadi satu zona lingkaran
   const clusteredZones = [];
