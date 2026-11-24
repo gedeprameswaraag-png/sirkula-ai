@@ -2,16 +2,29 @@ const { GoogleGenAI } = require('@google/genai');
 const env = require('../config/env');
 
 // ONNX hanya aktif jika LOCAL_AI_URL diisi eksplisit (tidak untuk Vercel).
-const LOCAL_AI_URL = process.env.LOCAL_AI_URL || '';
+const LOCAL_AI_URL = (env.LOCAL_AI_URL || process.env.LOCAL_AI_URL || '').trim();
 
 const LOCAL_AI_TIMEOUT_MS = Number(
   process.env.LOCAL_AI_TIMEOUT_MS || 30000
 );
 
-const GEMINI_MODEL =
-  env.GEMINI_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const PRIMARY_GEMINI_MODEL = (
+  env.GEMINI_MODEL ||
+  process.env.GEMINI_MODEL ||
+  'gemini-3.5-flash-lite'
+).trim();
 
-const RETRYABLE_STATUS = [500, 502, 503, 504];
+// Daftar model cadangan otomatis jika model utama 404 NOT_FOUND
+const GEMINI_CANDIDATE_MODELS = [
+  ...new Set([
+    PRIMARY_GEMINI_MODEL,
+    'gemini-3.5-flash-lite',
+    'gemini-3-flash-preview',
+    'gemini-2.5-flash-lite'
+  ])
+];
+
+const RETRYABLE_STATUS = [429, 500, 502, 503, 504];
 
 const VALID_CATEGORIES = [
   'invalid_photo',
@@ -21,16 +34,18 @@ const VALID_CATEGORIES = [
 ];
 
 let geminiClient = null;
+let cachedApiKey = null;
 
 function getGeminiClient() {
-  const apiKey = env.GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+  const apiKey = (env.GEMINI_API_KEY || process.env.GEMINI_API_KEY || '').trim();
 
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY tidak dikonfigurasi.');
+    throw new Error('GEMINI_API_KEY tidak dikonfigurasi di environment variables.');
   }
 
-  if (!geminiClient) {
+  if (!geminiClient || cachedApiKey !== apiKey) {
     geminiClient = new GoogleGenAI({ apiKey });
+    cachedApiKey = apiKey;
   }
 
   return geminiClient;
@@ -42,35 +57,21 @@ function sleep(ms) {
 
 function clampScore(value, min = 0, max = 100) {
   const number = Number(value);
-
   if (!Number.isFinite(number)) return min;
-
   return Math.min(max, Math.max(min, Math.round(number)));
 }
 
 function normalizeSeverity(rawLevel, score = 30) {
   const value = String(rawLevel || '').toLowerCase().trim();
 
-  if (['critical', 'kritis', 'sangat_parah', 'sangat parah'].includes(value)) {
-    return 'critical';
-  }
-
-  if (['high', 'tinggi', 'parah', 'berat'].includes(value)) {
-    return 'high';
-  }
-
-  if (['medium', 'sedang', 'menengah'].includes(value)) {
-    return 'medium';
-  }
-
-  if (['low', 'rendah', 'ringan'].includes(value)) {
-    return 'low';
-  }
+  if (['critical', 'kritis', 'sangat_parah', 'sangat parah'].includes(value)) return 'critical';
+  if (['high', 'tinggi', 'parah', 'berat'].includes(value)) return 'high';
+  if (['medium', 'sedang', 'menengah'].includes(value)) return 'medium';
+  if (['low', 'rendah', 'ringan'].includes(value)) return 'low';
 
   if (score >= 80) return 'critical';
   if (score >= 60) return 'high';
   if (score >= 38) return 'medium';
-
   return 'low';
 }
 
@@ -120,21 +121,15 @@ function computeLocalImpactScore(data) {
   const count = Number(data.jumlah_objek || 0);
 
   let base = 28;
-
   if (level === 'berat') base = 75;
   else if (level === 'sedang') base = 50;
 
-  const areaBonus = Math.min(
-    18,
-    Math.round(areaM2 * 4 + pileAreaM2 * 5)
-  );
-
+  const areaBonus = Math.min(18, Math.round(areaM2 * 4 + pileAreaM2 * 5));
   const countBonus = Math.min(7, Math.floor(count / 3));
 
   return clampScore(base + areaBonus + countBonus, 15, 100);
 }
 
-// Membersihkan pagar kode markdown jika model tetap menambahkannya.
 function parseJsonResponse(text) {
   const cleaned = String(text || '')
     .replace(/^\s*```(?:json)?/i, '')
@@ -158,19 +153,13 @@ async function analyzeWithLocalModel(
   }
 
   const formData = new FormData();
-
-  const blob = new Blob([fileBuffer], { type: mimeType });
+  const blob = new Blob([fileBuffer], { type: mimeType || 'image/jpeg' });
   formData.append('foto', blob, filename);
 
   const controller = new AbortController();
-
-  const timeout = setTimeout(
-    () => controller.abort(),
-    LOCAL_AI_TIMEOUT_MS
-  );
+  const timeout = setTimeout(() => controller.abort(), LOCAL_AI_TIMEOUT_MS);
 
   let response;
-
   try {
     response = await fetch(LOCAL_AI_URL, {
       method: 'POST',
@@ -181,39 +170,24 @@ async function analyzeWithLocalModel(
     if (error.name === 'AbortError') {
       throw new Error('Python AI timeout.');
     }
-
-    throw new Error(
-      `Python AI tidak dapat dihubungi: ${error.message}`
-    );
+    throw new Error(`Python AI tidak dapat dihubungi: ${error.message}`);
   } finally {
     clearTimeout(timeout);
   }
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => '');
-
-    throw new Error(
-      `Local AI error (${response.status}): ${errorText}`
-    );
+    throw new Error(`Local AI error (${response.status}): ${errorText}`);
   }
 
   const data = await response.json();
-
   const status = String(data.status || '').toLowerCase();
   const jumlahObjek = Number(data.jumlah_objek || 0);
-
-  const alasanList = Array.isArray(data.alasan)
-    ? data.alasan
-    : [];
-
-  const objekList = Array.isArray(data.objek)
-    ? data.objek
-    : [];
+  const alasanList = Array.isArray(data.alasan) ? data.alasan : [];
+  const objekList = Array.isArray(data.objek) ? data.objek : [];
 
   const maxConf = objekList.length > 0
-    ? Math.max(
-        ...objekList.map((obj) => Number(obj.confidence || 0))
-      )
+    ? Math.max(...objekList.map((obj) => Number(obj.confidence || 0)))
     : 0;
 
   if (status === 'foto_ulang') {
@@ -245,17 +219,10 @@ async function analyzeWithLocalModel(
   }
 
   const impactScore = computeLocalImpactScore(data);
-  const severityLevel = normalizeSeverity(
-    data.level,
-    impactScore
-  );
+  const severityLevel = normalizeSeverity(data.level, impactScore);
 
   const detectedClasses = [
-    ...new Set(
-      objekList
-        .map((obj) => obj.kelas)
-        .filter(Boolean)
-    )
+    ...new Set(objekList.map((obj) => obj.kelas).filter(Boolean))
   ].join(', ');
 
   const labelLevel = String(data.level || 'sedang').toUpperCase();
@@ -266,11 +233,7 @@ async function analyzeWithLocalModel(
     capture_category: 'waste_detected',
     is_valid_capture: true,
     is_clean_location: false,
-
-    // ONNX belum memvalidasi foto layar, poster, ilustrasi,
-    // atau media cetak, sehingga tetap perlu pemeriksaan admin.
     needs_admin_review: true,
-
     severity_level: severityLevel,
     impact_score: impactScore,
     description:
@@ -361,7 +324,6 @@ async function generateWithRetry(request, maxRetries = 2) {
       return await ai.models.generateContent(request);
     } catch (error) {
       lastError = error;
-
       const status = Number(error.status || error.code);
 
       if (!RETRYABLE_STATUS.includes(status) || attempt === maxRetries) {
@@ -376,39 +338,85 @@ async function generateWithRetry(request, maxRetries = 2) {
 }
 
 async function analyzeWithGemini(fileBuffer, mimeType) {
-  const response = await generateWithRetry({
-    model: GEMINI_MODEL,
-    contents: [
-      {
-        inlineData: {
-          data: fileBuffer.toString('base64'),
-          mimeType
-        }
-      },
-      GEMINI_PROMPT
-    ],
-    config: {
-      responseMimeType: 'application/json'
-    }
-  });
+  if (!fileBuffer || fileBuffer.length === 0) {
+    throw new Error('Buffer gambar kosong.');
+  }
 
-  if (!response.text) {
+  const safeMimeType = mimeType && mimeType.startsWith('image/')
+    ? mimeType
+    : 'image/jpeg';
+
+  let response = null;
+  let usedModel = null;
+  let lastModelError = null;
+
+  for (const modelName of GEMINI_CANDIDATE_MODELS) {
+    try {
+      response = await generateWithRetry({
+        model: modelName,
+        contents: [
+          GEMINI_PROMPT,
+          {
+            inlineData: {
+              data: fileBuffer.toString('base64'),
+              mimeType: safeMimeType
+            }
+          }
+        ],
+        config: {
+          responseMimeType: 'application/json'
+        }
+      });
+      usedModel = modelName;
+      break;
+    } catch (err) {
+      lastModelError = err;
+      const status = Number(err.status || err.code);
+      const msg = String(err.message || '');
+
+      // Jika model 404 NOT_FOUND, lanjutkan ke model kandidat berikutnya
+      if (status === 404 || msg.includes('404') || msg.includes('NOT_FOUND')) {
+        console.warn(`[Gemini] Model ${modelName} tidak tersedia (404), mencoba kandidat berikutnya...`);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (!response) {
+    throw lastModelError || new Error('Semua kandidat model Gemini gagal.');
+  }
+
+  let rawText = '';
+  try {
+    rawText = typeof response.text === 'function' ? response.text() : response.text;
+  } catch (textErr) {
+    const candidateText = response?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (candidateText) {
+      rawText = candidateText;
+    } else {
+      throw new Error(`Respons Gemini diblokir atau tidak terbaca: ${textErr.message}`);
+    }
+  }
+
+  if (!rawText) {
     throw new Error('Gemini memberikan respons kosong.');
   }
 
   let parsed;
-
   try {
-    parsed = parseJsonResponse(response.text);
+    parsed = parseJsonResponse(rawText);
   } catch {
-    throw new Error('Respons Gemini bukan JSON yang valid.');
+    throw new Error(`Respons Gemini bukan JSON valid: ${rawText.slice(0, 120)}`);
   }
 
-  const category = String(parsed.capture_category || '').toLowerCase();
+  const category = String(parsed.capture_category || '').toLowerCase().trim();
 
   if (!VALID_CATEGORIES.includes(category)) {
-    throw new Error('Kategori hasil Gemini tidak valid.');
+    throw new Error(`Kategori hasil Gemini tidak valid: "${category}"`);
   }
+
+  console.log(`[Gemini SUCCESS] Model: ${usedModel} | Kategori: ${category}`);
 
   const description = String(
     parsed.description || 'Analisis foto selesai.'
@@ -453,8 +461,8 @@ async function analyzeWasteImage(
     return await analyzeWithGemini(fileBuffer, mimeType);
   } catch (geminiError) {
     console.error('[Gemini ERROR]', {
-      model: GEMINI_MODEL,
-      status: geminiError.status,
+      attemptedModels: GEMINI_CANDIDATE_MODELS,
+      status: geminiError.status || geminiError.code,
       message: geminiError.message
     });
 

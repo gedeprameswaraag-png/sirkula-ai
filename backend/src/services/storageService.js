@@ -27,4 +27,19 @@ async function getSignedImageUrl(bucket, path, expiresInSeconds = 3600) {
   return error ? null : data.signedUrl;
 }
 
-module.exports = { uploadPrivateImage, removeFile, getSignedImageUrl };
+// Menandatangani banyak foto sekaligus (satu panggilan ke storage). Hasil: Map(path -> url)
+async function getSignedImageUrls(bucket, paths, expiresInSeconds = 3600) {
+  const unique = [...new Set((paths || []).filter(Boolean))];
+  const urlMap = new Map();
+  if (!unique.length) return urlMap;
+
+  const { data, error } = await supabaseAdmin.storage.from(bucket).createSignedUrls(unique, expiresInSeconds);
+  if (error || !data) return urlMap;
+
+  data.forEach((item) => {
+    if (item.signedUrl && item.path) urlMap.set(item.path, item.signedUrl);
+  });
+  return urlMap;
+}
+
+module.exports = { uploadPrivateImage, removeFile, getSignedImageUrl, getSignedImageUrls };
