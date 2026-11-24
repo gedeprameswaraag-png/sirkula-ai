@@ -16,45 +16,48 @@ const app = express();
 // BASIC CONFIGURATION
 // =====================================================
 
-app.set('trust proxy', env.TRUST_PROXY === '1' ? 1 : false);
+// Di Vercel selalu ada 1 proxy di depan aplikasi.
+app.set('trust proxy', env.TRUST_PROXY === '0' && !process.env.VERCEL ? false : 1);
 app.disable('x-powered-by');
 
 // =====================================================
 // CORS CONFIGURATION
 // =====================================================
 
-const corsOptions = {
-  origin: (origin, callback) => {
-    // Izinkan request tanpa Origin (contoh: server-to-server)
-    if (!origin) {
-      return callback(null, true);
+// Browser mengirim header Origin pada setiap POST, termasuk saat frontend
+// dan backend satu domain. Origin yang sama dengan Host server otomatis
+// diizinkan, sisanya harus terdaftar di CORS_ORIGIN.
+const corsOptionsDelegate = (req, callback) => {
+  const origin = req.header('Origin');
+  const host = req.header('X-Forwarded-Host') || req.header('Host');
+
+  let sameOrigin = false;
+
+  if (origin && host) {
+    try {
+      sameOrigin = new URL(origin).host === host;
+    } catch {
+      sameOrigin = false;
     }
+  }
 
-    // Periksa apakah origin terdaftar
-    if (env.CORS_ORIGINS.includes(origin)) {
-      return callback(null, true);
-    }
+  if (!origin || sameOrigin || env.CORS_ORIGINS.includes(origin)) {
+    return callback(null, {
+      origin: true,
+      methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+      optionsSuccessStatus: 204
+    });
+  }
 
-    return callback(
-      new Error(`Origin tidak diizinkan oleh CORS: ${origin}`)
-    );
-  },
-
-  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization'
-  ],
-
-  optionsSuccessStatus: 204
+  return callback(new Error(`Origin tidak diizinkan oleh CORS: ${origin}`));
 };
 
 // CORS harus dipasang sebelum middleware lainnya
-app.use(cors(corsOptions));
+app.use(cors(corsOptionsDelegate));
 
 // Tangani preflight request secara eksplisit
-app.options(/.*/, cors(corsOptions));
+app.options(/.*/, cors(corsOptionsDelegate));
 
 // =====================================================
 // SECURITY MIDDLEWARE
@@ -120,4 +123,12 @@ if (fs.existsSync(distPath)) {
 
 app.use(errorHandler);
 
+// Di luar Vercel (lokal / server biasa) aplikasi dijalankan langsung.
+if (!process.env.VERCEL && require.main === module) {
+  app.listen(env.PORT, '0.0.0.0', () => {
+    console.log(`SirkulaAI Backend berjalan pada port ${env.PORT}`);
+  });
+}
+
 module.exports = app;
+
