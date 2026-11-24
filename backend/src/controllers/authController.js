@@ -125,6 +125,7 @@ exports.me = async (req, res, next) => {
     return res.status(200).json({
       success: true,
       message: 'Data pengguna berhasil diambil.',
+      user: req.user, // dibaca frontend (me.user)
       data: req.user
     });
   } catch (error) {
